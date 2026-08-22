@@ -868,6 +868,100 @@ mod tests {
     use crate::point;
 
     #[test]
+    fn touch_gesture_arena_recognizes_tap() {
+        let mut arena = TouchGestureArena::new(GestureTuning::default());
+        let position = point(px(10.), px(20.));
+        let started = TouchEvent {
+            id: TouchId(1),
+            phase: TouchPhase::Started,
+            position,
+            force: None,
+        };
+        assert!(arena.handle(&started).is_empty());
+
+        let ended = TouchEvent {
+            phase: TouchPhase::Ended,
+            ..started
+        };
+        let output = arena.handle(&ended);
+        let Some(TouchGestureOutput::Click(click)) = output.first() else {
+            panic!("tap should produce a touch click");
+        };
+        assert_eq!(click.position, position);
+        assert_eq!(click.tap_count, 1);
+        assert!(!click.long_press);
+    }
+
+    #[test]
+    fn touch_gesture_arena_promotes_movement_to_scroll() {
+        let mut arena = TouchGestureArena::new(GestureTuning::default());
+        let started = TouchEvent {
+            id: TouchId(1),
+            phase: TouchPhase::Started,
+            position: point(px(10.), px(20.)),
+            force: None,
+        };
+        arena.handle(&started);
+
+        let moved = TouchEvent {
+            phase: TouchPhase::Moved,
+            position: point(px(10.), px(40.)),
+            ..started.clone()
+        };
+        let output = arena.handle(&moved);
+        let Some(TouchGestureOutput::PlatformInput(PlatformInput::ScrollWheel(scroll))) =
+            output.first()
+        else {
+            panic!("pan should produce a scroll event");
+        };
+        assert_eq!(scroll.touch_phase, TouchPhase::Started);
+        let ScrollDelta::Pixels(delta) = scroll.delta else {
+            panic!("touch pan should scroll in pixels");
+        };
+        assert_eq!(delta, point(px(0.), px(20.)));
+
+        let ended = TouchEvent {
+            phase: TouchPhase::Ended,
+            ..moved
+        };
+        let output = arena.handle(&ended);
+        let Some(TouchGestureOutput::PlatformInput(PlatformInput::ScrollWheel(scroll))) =
+            output.first()
+        else {
+            panic!("ending a pan should end the scroll");
+        };
+        assert_eq!(scroll.touch_phase, TouchPhase::Ended);
+    }
+
+    #[test]
+    fn secondary_touch_does_not_cancel_primary_touch() {
+        let mut arena = TouchGestureArena::new(GestureTuning::default());
+        let primary = TouchEvent {
+            id: TouchId(1),
+            phase: TouchPhase::Started,
+            position: point(px(10.), px(20.)),
+            force: None,
+        };
+        arena.handle(&primary);
+
+        let secondary_ended = TouchEvent {
+            id: TouchId(2),
+            phase: TouchPhase::Ended,
+            ..primary.clone()
+        };
+        assert!(arena.handle(&secondary_ended).is_empty());
+
+        let primary_ended = TouchEvent {
+            phase: TouchPhase::Ended,
+            ..primary
+        };
+        assert!(matches!(
+            arena.handle(&primary_ended).first(),
+            Some(TouchGestureOutput::Click(_))
+        ));
+    }
+
+    #[test]
     fn ongoing_scroll_locks_to_dominant_axis() {
         let now = Instant::now();
         let mut ongoing_scroll = OngoingScroll::default();
