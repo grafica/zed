@@ -174,7 +174,7 @@ mod apple_build {
 
         let output = Command::new("xcrun")
             .args(["-sdk", sdk, "metallib"])
-            .arg(air_output_path)
+            .arg(&air_output_path)
             .arg("-o")
             .arg(metallib_output_path)
             .output()

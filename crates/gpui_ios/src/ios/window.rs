@@ -656,6 +656,7 @@ impl IosWindow {
             phase: touch_phase(touch).into(),
             position,
             force: touch_force(touch),
+            predicted_position: None,
         };
         if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
             callback(PlatformInput::Touch(event));

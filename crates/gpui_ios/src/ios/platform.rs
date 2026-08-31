@@ -338,8 +338,12 @@ impl Platform for IosPlatform {
         // Would use UIDocumentInteractionController or UIActivityViewController
     }
 
-    fn on_quit(&self, callback: Box<dyn FnMut()>) {
-        super::ffi::set_quit_callback(callback);
+    fn on_quit(&self, mut callback: Box<dyn FnMut() -> bool>) {
+        // UIKit has no cancellable quit; run the callback for its side effects
+        // and discard the allow/deny verdict.
+        super::ffi::set_quit_callback(Box::new(move || {
+            callback();
+        }));
     }
 
     fn on_reopen(&self, _callback: Box<dyn FnMut()>) {

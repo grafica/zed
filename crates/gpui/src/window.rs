@@ -18,7 +18,7 @@ use crate::{
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange, WindowInsets,
     TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
     Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
     WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
@@ -1397,11 +1397,6 @@ impl Window {
             .and_then(|titlebar| titlebar.title.clone());
 
         let window_bounds = window_bounds.unwrap_or_else(|| default_bounds(display_id, cx));
-        let gesture_tuning = cx
-            .platform
-            .gestures()
-            .map(|gestures| gestures.tuning())
-            .unwrap_or_default();
         let mut platform_window = cx.platform.open_window(
             handle,
             WindowParams {
@@ -5106,33 +5101,6 @@ impl Window {
     /// Dispatch a mouse, keyboard, or touch event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
-        if let PlatformInput::Touch(touch) = event {
-            let semantic_events = self.touch_gesture_arena.handle(&touch);
-            let mut result = self.dispatch_event_with_modality(
-                PlatformInput::Touch(touch),
-                Some(InputModality::Touch),
-                cx,
-            );
-            for semantic_event in semantic_events {
-                result = match semantic_event {
-                    TouchGestureOutput::PlatformInput(event) => {
-                        self.dispatch_event_with_modality(event, Some(InputModality::Touch), cx)
-                    }
-                    TouchGestureOutput::Click(event) => self.dispatch_touch_event(&event, cx),
-                };
-            }
-            return result;
-        }
-
-        self.dispatch_event_with_modality(event, None, cx)
-    }
-
-    fn dispatch_event_with_modality(
-        &mut self,
-        event: PlatformInput,
-        input_modality: Option<InputModality>,
-        cx: &mut App,
-    ) -> DispatchEventResult {
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();
@@ -5140,12 +5108,12 @@ impl Window {
         // Hover is suppressed during keyboard modality so that keyboard navigation
         // doesn't show hover highlights on the item under the mouse cursor.
         let old_modality = self.last_input_modality;
-        self.last_input_modality = input_modality.unwrap_or_else(|| match &event {
+        self.last_input_modality = match &event {
             PlatformInput::KeyDown(_) => InputModality::Keyboard,
             PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_) => InputModality::Mouse,
             PlatformInput::Touch(_) => InputModality::Touch,
             _ => self.last_input_modality,
-        });
+        };
         if self.last_input_modality != old_modality {
             self.refresh();
         }
@@ -5247,13 +5215,7 @@ impl Window {
                     PlatformInput::FileDrop(FileDropEvent::Ended)
                 }
             },
-            PlatformInput::Touch(touch) => {
-                if touch.phase == crate::TouchPhase::Started {
-                    self.mouse_position = touch.position;
-                    self.mouse_hit_test = self.rendered_frame.hit_test(touch.position);
-                }
-                PlatformInput::Touch(touch)
-            }
+            PlatformInput::Touch(touch) => PlatformInput::Touch(touch),
             PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) => event,
         };
 
@@ -5275,40 +5237,6 @@ impl Window {
         }
         #[cfg(feature = "profiler")]
         self.window_profiler.end_input(caused_invalidation);
-
-        DispatchEventResult {
-            propagate: cx.propagate_event,
-            default_prevented: self.default_prevented,
-        }
-    }
-
-    fn dispatch_touch_event(&mut self, event: &dyn Any, cx: &mut App) -> DispatchEventResult {
-        cx.propagate_event = true;
-        self.default_prevented = false;
-
-        let mut touch_listeners = mem::take(&mut self.rendered_frame.touch_listeners);
-        for listener in &mut touch_listeners {
-            let Some(listener) = listener.as_mut() else {
-                continue;
-            };
-            listener(event, DispatchPhase::Capture, self, cx);
-            if !cx.propagate_event {
-                break;
-            }
-        }
-
-        if cx.propagate_event {
-            for listener in touch_listeners.iter_mut().rev() {
-                let Some(listener) = listener.as_mut() else {
-                    continue;
-                };
-                listener(event, DispatchPhase::Bubble, self, cx);
-                if !cx.propagate_event {
-                    break;
-                }
-            }
-        }
-        self.rendered_frame.touch_listeners = touch_listeners;
 
         DispatchEventResult {
             propagate: cx.propagate_event,
