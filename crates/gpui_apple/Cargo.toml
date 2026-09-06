@@ -24,7 +24,9 @@ gpui.workspace = true
 anyhow.workspace = true
 block.workspace = true
 collections.workspace = true
+core-foundation.workspace = true
 core-graphics.workspace = true
+core-video.workspace = true
 derive_more.workspace = true
 etagere.workspace = true
 foreign-types.workspace = true
@@ -33,10 +35,6 @@ log.workspace = true
 metal.workspace = true
 objc.workspace = true
 parking_lot.workspace = true
-
-[target.'cfg(target_os = "macos")'.dependencies]
-core-foundation.workspace = true
-core-video.workspace = true
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.build-dependencies]
 cbindgen.workspace = true
