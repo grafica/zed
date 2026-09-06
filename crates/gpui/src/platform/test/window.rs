@@ -2,8 +2,9 @@ use crate::{
     AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
     DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, RequestFrameOptions, Scene, Size, TestPlatform, TextInputConfiguration, TextInputStateChange, TileId,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    PromptButton, RequestFrameOptions, Scene, Size, TestPlatform, TextInputConfiguration,
+    TextInputStateChange, TileId, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowParams,
 };
 use collections::HashMap;
 use gpui_util::ResultExt as _;
@@ -140,6 +141,10 @@ impl TestWindow {
     /// Every [`TextInputConfiguration`] forwarded to this window, in order.
     pub fn text_input_configurations(&self) -> Vec<TextInputConfiguration> {
         self.0.lock().text_input_configurations.clone()
+    }
+
+    pub fn text_input_state_changes(&self) -> Vec<TextInputStateChange> {
+        self.0.lock().text_input_state_changes.clone()
     }
 
     pub fn simulate_resize(&mut self, size: Size<Pixels>) {
