@@ -71,6 +71,23 @@ struct MacTextSystemState {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
+    /// `CTFont`s already instantiated at a given size, keyed by font and by the size's
+    /// exact bit pattern.
+    ///
+    /// `layout_line` sets `kCTFontAttributeName` once per run, and building that value
+    /// means `clone_with_font_size`, which is `CTFontCreateCopyWithAttributes`. For a
+    /// variable font -- and the system font is one -- that re-runs the variation
+    /// machinery every call: profiling a live view on device put
+    /// `ItemVariationStore::ComputeScalar` and `ValueForDeltaSet` among the hot leaves
+    /// inside `layout_line`.
+    ///
+    /// Sizes come from a small fixed set in practice (a UI has a handful of text
+    /// styles), so this is bounded by the styles in use rather than by anything the
+    /// content does. Keyed on `to_bits` rather than on the float, both because f32 is
+    /// not `Eq` and because `layout_line` deliberately alternates `size` and
+    /// `size.next_up()` to break ligatures across runs -- two values that must not
+    /// collide into one entry.
+    scaled_fonts: HashMap<(usize, u32), CTFont>,
 }
 
 impl MacTextSystem {
@@ -84,6 +101,7 @@ impl MacTextSystem {
             font_ids_by_postscript_name: HashMap::default(),
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
+            scaled_fonts: HashMap::default(),
         }))
     }
 }
@@ -529,6 +547,21 @@ impl MacTextSystemState {
         }
     }
 
+    /// A `CTFont` for `font_id` at `font_size`, instantiated once and reused.
+    ///
+    /// Returns a clone, which is a `CFRetain` rather than a font instantiation.
+    fn scaled_font(&mut self, font_id: usize, font_size: Pixels) -> CTFont {
+        let size = f32::from(font_size);
+        self.scaled_fonts
+            .entry((font_id, size.to_bits()))
+            .or_insert_with(|| {
+                self.fonts[font_id]
+                    .native_font()
+                    .clone_with_font_size(size as CGFloat)
+            })
+            .clone()
+    }
+
     fn layout_line(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
         // Construct the attributed string, converting UTF8 ranges to UTF16 ranges.
         let mut string = CFMutableAttributedString::new();
@@ -561,12 +594,9 @@ impl MacTextSystemState {
                 } else {
                     font_size
                 };
+                let scaled = self.scaled_font(run.font_id.0, font_size);
                 unsafe {
-                    string.set_attribute(
-                        cf_range,
-                        kCTFontAttributeName,
-                        &font.native_font().clone_with_font_size(font_size.into()),
-                    );
+                    string.set_attribute(cf_range, kCTFontAttributeName, &scaled);
                 }
                 break_ligature = !break_ligature;
             }
