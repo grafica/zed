@@ -1,6 +1,6 @@
 use crate::{
-    App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    ObjectFit, Pixels, Style, StyleRefinement, Styled, Window,
+    App, Bounds, DefiniteLength, Element, ElementId, GlobalElementId, InspectorElementId,
+    IntoElement, LayoutId, Length, ObjectFit, Pixels, Style, StyleRefinement, Styled, Window, px,
 };
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use core_video::pixel_buffer::CVPixelBuffer;
@@ -67,6 +67,45 @@ impl Element for Surface {
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut style = Style::default();
         style.refine(&self.style);
+
+        // Give the surface the intrinsic size of its buffer, the way `img` does with the
+        // intrinsic size of its image. Without this a surface laid out with only
+        // `max_w`/`max_h` -- or with nothing at all -- resolves `Length::Auto` against no
+        // content, lays out at 0x0, and paints NOTHING, silently. Every timer around it
+        // still reports a plausible number, because what they measure is the handoff of
+        // the buffer rather than the draw.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            let SurfaceSource::Surface(buffer) = &self.source;
+            let size = crate::size(
+                px(buffer.get_width() as f32),
+                px(buffer.get_height() as f32),
+            );
+            if size.width > px(0.) && size.height > px(0.) {
+                if style.aspect_ratio.is_none() {
+                    style.aspect_ratio = Some(size.width / size.height);
+                }
+                if let Length::Auto = style.size.width {
+                    style.size.width = match style.size.height {
+                        Length::Definite(DefiniteLength::Absolute(abs)) => {
+                            let height = abs.to_pixels(window.rem_size());
+                            Length::Definite(px(size.width.0 * height.0 / size.height.0).into())
+                        }
+                        _ => Length::Definite(size.width.into()),
+                    };
+                }
+                if let Length::Auto = style.size.height {
+                    style.size.height = match style.size.width {
+                        Length::Definite(DefiniteLength::Absolute(abs)) => {
+                            let width = abs.to_pixels(window.rem_size());
+                            Length::Definite(px(size.height.0 * width.0 / size.width.0).into())
+                        }
+                        _ => Length::Definite(size.height.into()),
+                    };
+                }
+            }
+        }
+
         let layout_id = window.request_layout(style, [], cx);
         (layout_id, ())
     }
