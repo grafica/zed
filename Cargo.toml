@@ -981,6 +981,12 @@ features = [
 tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "43623ec9bf0eaaf7113285c46e8a09018f181b18" }
 async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
 async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
+# taffy with DioxusLabs/taffy#1181: `TaffyTree::clear`/`remove` did not drop the removed
+# nodes' contexts, so a node's measure closure -- and everything it captured -- outlived
+# the node. gpui calls `clear()` once per FRAME and re-adds every node, so any frame whose
+# tree shrank stranded the contexts of the nodes that went away. Drop this patch once the
+# fix is released upstream.
+taffy = { git = "https://github.com/sayrer/taffy", branch = "fix/drop-node-context-0.13" }
 windows-capture = { git = "https://github.com/zed-industries/windows-capture.git", rev = "f0d6c1b6691db75461b732f6d5ff56eed002eeb9" }
 calloop = { git = "https://github.com/zed-industries/calloop" }
 livekit = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "0a1c519cfce9b365229026b55de9b9dbdb6fed3c" }
