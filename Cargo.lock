@@ -7591,7 +7591,7 @@ dependencies = [
  "core-foundation-sys",
  "core-graphics 0.24.0",
  "core-text",
- "futures 0.3.32",
+ "futures 0.3.34",
  "gpui",
  "gpui_apple",
  "log",
