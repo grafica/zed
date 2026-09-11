@@ -106,3 +106,29 @@ unsafe extern "C" fn trampoline(runnable: *mut c_void) {
     let task = unsafe { RunnableVariant::from_raw(NonNull::new_unchecked(runnable as *mut ())) };
     task.run();
 }
+
+/// Run `f` on the main thread, via the same main queue `dispatch_on_main_thread` uses.
+///
+/// `prevent_idle_sleep`'s `ActivityGuard` can be dropped on any thread — it is a plain
+/// RAII guard handed to arbitrary callers — while `setIdleTimerDisabled:` is UIKit and
+/// so is main-thread only. This is the hop between the two. It takes a boxed closure
+/// rather than a `RunnableVariant` because there is no task to schedule, just a flag to
+/// set, and going through the executor would need a `ForegroundExecutor` the guard
+/// cannot hold.
+pub(crate) fn run_on_main_thread(f: impl FnOnce() + Send + 'static) {
+    let boxed: Box<Box<dyn FnOnce() + Send>> = Box::new(Box::new(f));
+    // SAFETY: the context is a `Box` we leak here and reclaim exactly once in
+    // `call_boxed_closure`, which libdispatch invokes exactly once on the main queue.
+    unsafe {
+        dispatch_async_f(
+            dispatch_get_main_queue(),
+            Box::into_raw(boxed) as *mut c_void,
+            Some(call_boxed_closure),
+        );
+    }
+}
+
+unsafe extern "C" fn call_boxed_closure(context: *mut c_void) {
+    let f = unsafe { Box::from_raw(context as *mut Box<dyn FnOnce() + Send>) };
+    f();
+}
