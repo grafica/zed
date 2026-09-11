@@ -19,14 +19,15 @@ use core_foundation::{
 };
 use futures::channel::oneshot;
 use gpui::{
-    Action, AnyWindowHandle, AppLifecyclePhase, BackgroundExecutor, ClipboardItem, CursorStyle,
-    DummyKeyboardMapper, ForegroundExecutor, Keymap, Menu, MenuItem, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Result, Task, ThermalState, WindowAppearance, WindowParams,
+    Action, ActivityGuard, AnyWindowHandle, AppLifecyclePhase, BackgroundExecutor, ClipboardItem,
+    CursorStyle, DummyKeyboardMapper, ForegroundExecutor, Keymap, Menu, MenuItem,
+    PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper,
+    PlatformTextSystem, PlatformWindow, Result, Task, ThermalState, WindowAppearance, WindowParams,
 };
-use objc2::runtime::AnyObject;
+use objc2::runtime::{AnyObject, Bool};
 use objc2::{class, msg_send};
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -34,6 +35,26 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
+
+/// Outstanding `prevent_idle_sleep` guards. See that method for why this is a count and
+/// why it is process-wide.
+static IDLE_SLEEP_PREVENTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Set `UIApplication.idleTimerDisabled`, hopping to the main thread because it is UIKit.
+fn set_idle_timer_disabled(disabled: bool) {
+    super::dispatcher::run_on_main_thread(move || {
+        // SAFETY: `sharedApplication` is the process's UIApplication, and this runs on
+        // the main thread. It is null only before the application object exists, which
+        // is checked.
+        unsafe {
+            let app: *mut AnyObject = msg_send![class!(UIApplication), sharedApplication];
+            if app.is_null() {
+                return;
+            }
+            let _: () = msg_send![app, setIdleTimerDisabled: Bool::new(disabled)];
+        }
+    });
+}
 
 pub struct IosPlatform(Mutex<IosPlatformState>);
 
@@ -562,6 +583,29 @@ impl Platform for IosPlatform {
         self.0.lock().thermal_state_callback = Some(callback);
         // In a full implementation, we would register for
         // NSProcessInfoThermalStateDidChangeNotification
+    }
+
+    /// Keep the display awake while any guard returned by this method is alive.
+    ///
+    /// iOS has no `NSProcessInfo` equivalent that reaches the display: what macOS does
+    /// here (`beginActivityWithOptions:`) governs app napping and sudden termination and
+    /// does NOT stop the screen locking, so mirroring it would under-deliver on the
+    /// method's name. `UIApplication.idleTimerDisabled` is the mechanism that does what
+    /// the trait promises.
+    ///
+    /// REFCOUNTED, because the flag is a single process-wide boolean and the guards are
+    /// not: two overlapping callers clearing it independently would let the screen lock
+    /// while the second still wanted it awake. The count is process-wide for the same
+    /// reason the flag is.
+    fn prevent_idle_sleep(&self, _reason: &str) -> Task<Result<ActivityGuard>> {
+        if IDLE_SLEEP_PREVENTIONS.fetch_add(1, Ordering::SeqCst) == 0 {
+            set_idle_timer_disabled(true);
+        }
+        Task::ready(Ok(ActivityGuard::new(|| {
+            if IDLE_SLEEP_PREVENTIONS.fetch_sub(1, Ordering::SeqCst) == 1 {
+                set_idle_timer_disabled(false);
+            }
+        })))
     }
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
