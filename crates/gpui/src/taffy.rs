@@ -66,6 +66,7 @@ impl TaffyLayoutEngine {
         scale_factor: f32,
         children: &[LayoutId],
     ) -> LayoutId {
+        let _t_request = crate::frame_stats::Timer::start(crate::frame_stats::T_REQUEST);
         let taffy_style = style.to_taffy(rem_size, scale_factor);
 
         if children.is_empty() {
@@ -95,6 +96,7 @@ impl TaffyLayoutEngine {
         ) -> Size<Pixels>
         + 'static,
     ) -> LayoutId {
+        let _t_request_measured = crate::frame_stats::Timer::start(crate::frame_stats::T_REQUEST);
         let taffy_style = style.to_taffy(rem_size, scale_factor);
         let measure = Box::new(measure) as Box<MeasureFn>;
         #[cfg(feature = "stacker")]
@@ -191,6 +193,8 @@ impl TaffyLayoutEngine {
         window: &mut Window,
         cx: &mut App,
     ) {
+        crate::frame_stats::bump(crate::frame_stats::COMPUTES);
+        let _t_layout = crate::frame_stats::Timer::start(crate::frame_stats::T_LAYOUT);
         // Leaving this here until we have a better instrumentation approach.
         // println!("Laying out {} children", self.count_all_children(id)?);
         // println!("Max layout depth: {}", self.max_depth(0, id)?);
@@ -259,8 +263,12 @@ impl TaffyLayoutEngine {
                         untransform(available_space.height),
                     );
 
-                    let measured_size: Size<Pixels> =
-                        (node_context.measure)(known_dimensions, available_space, window, cx);
+                    let measured_size: Size<Pixels> = {
+                        crate::frame_stats::bump(crate::frame_stats::MEASURES);
+                        let _t_measure =
+                            crate::frame_stats::Timer::start(crate::frame_stats::T_MEASURE);
+                        (node_context.measure)(known_dimensions, available_space, window, cx)
+                    };
                     snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
                 },
             )

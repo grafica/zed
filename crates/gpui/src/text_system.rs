@@ -142,6 +142,7 @@ impl TextSystem {
     ///
     /// Panics if the font and none of the fallbacks can be resolved.
     pub fn resolve_font(&self, font: &Font) -> FontId {
+        let _t_font = crate::frame_stats::Timer::start(crate::frame_stats::T_FONT);
         if let Ok(font_id) = self.font_id(font) {
             return font_id;
         }
@@ -317,6 +318,7 @@ impl TextSystem {
 
     /// Returns a handle to a line wrapper, for the given font and font size.
     pub fn line_wrapper(self: &Arc<Self>, font: Font, font_size: Pixels) -> LineWrapperHandle {
+        let _t_wrapper = crate::frame_stats::Timer::start(crate::frame_stats::T_WRAPPER);
         let lock = &mut self.wrapper_pool.lock();
         let font_id = self.resolve_font(&font);
         let wrappers = lock
@@ -526,6 +528,7 @@ impl WindowTextSystem {
         wrap_width: Option<Pixels>,
         line_clamp: Option<usize>,
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
+        let _t_shape = crate::frame_stats::Timer::start(crate::frame_stats::T_SHAPE);
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
 

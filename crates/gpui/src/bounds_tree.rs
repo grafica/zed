@@ -118,6 +118,7 @@ where
     /// The ordering is one greater than the maximum ordering of any
     /// existing bounds that intersect with the new bounds.
     pub fn insert(&mut self, new_bounds: Bounds<U>) -> u32 {
+        crate::frame_stats::bump(crate::frame_stats::BT_INSERTS);
         // Find maximum ordering among intersecting bounds
         let max_intersecting = self.find_max_ordering(&new_bounds);
         let ordering = max_intersecting + 1;
@@ -150,6 +151,7 @@ where
         }
 
         // Slow path: search the tree
+        crate::frame_stats::bump(crate::frame_stats::BT_SLOW);
         self.search_stack.clear();
         self.search_stack.push(NonNull::from(&self.nodes[root_idx]));
 
