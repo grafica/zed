@@ -593,10 +593,16 @@ impl LineLayoutCache {
 
         let current_frame = self.current_frame.upgradable_read();
         if let Some(layout) = current_frame.wrapped_lines.get(key) {
+            crate::frame_stats::bump(crate::frame_stats::TEXT_HIT);
             return layout.clone();
         }
 
         let previous_frame_entry = self.previous_frame.lock().wrapped_lines.remove_entry(key);
+        crate::frame_stats::bump(if previous_frame_entry.is_some() {
+            crate::frame_stats::TEXT_HIT
+        } else {
+            crate::frame_stats::TEXT_MISS
+        });
         if let Some((key, layout)) = previous_frame_entry {
             let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
             current_frame

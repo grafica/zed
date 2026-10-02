@@ -675,6 +675,7 @@ impl MetalRenderer {
         );
 
         for batch in scene.batches() {
+            gpui::frame_stats::bump(gpui::frame_stats::BATCHES);
             match batch {
                 PrimitiveBatch::Shadows(range) => {
                     self.draw_shadows(range, instance_bindings, viewport_size, command_encoder)
@@ -1217,6 +1218,7 @@ fn new_command_encoder_for_texture<'a>(
     viewport_size: Size<DevicePixels>,
     clear_color: Option<metal::MTLClearColor>,
 ) -> &'a metal::RenderCommandEncoderRef {
+    gpui::frame_stats::bump(gpui::frame_stats::ENCODERS);
     let render_pass_descriptor = metal::RenderPassDescriptor::new();
     let color_attachment = render_pass_descriptor
         .color_attachments()
