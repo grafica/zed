@@ -3439,6 +3439,7 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        let _t_draw = crate::frame_stats::Timer::start(crate::frame_stats::T_DRAW);
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
@@ -3523,6 +3524,7 @@ impl Window {
 
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
+        crate::frame_stats::frame_done();
         self.next_frame.finish(&mut self.rendered_frame);
 
         self.invalidator.set_phase(DrawPhase::Focus);
@@ -3685,7 +3687,9 @@ impl Window {
     }
 
     fn draw_roots(&mut self, cx: &mut App) {
+        let _t_render = crate::frame_stats::Timer::start(crate::frame_stats::T_RENDER);
         self.invalidator.set_phase(DrawPhase::Prepaint);
+        let _t_prepaint = crate::frame_stats::Timer::start(crate::frame_stats::T_PREPAINT);
         self.tooltip_bounds.take();
 
         self.a11y.sync_active_flag();
@@ -3758,9 +3762,11 @@ impl Window {
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
 
         // Now actually paint the elements.
+        drop(_t_prepaint);
         #[cfg(feature = "profiler")]
         let paint_start = Instant::now();
         self.invalidator.set_phase(DrawPhase::Paint);
+        let _t_paint = crate::frame_stats::Timer::start(crate::frame_stats::T_PAINT);
         root_element.paint(self, cx);
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -4844,6 +4850,7 @@ impl Window {
         font_size: Pixels,
         color: Hsla,
     ) -> Result<()> {
+        let _t_glyph = crate::frame_stats::Timer::start(crate::frame_stats::T_GLYPH);
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
@@ -5230,6 +5237,7 @@ impl Window {
         children: impl IntoIterator<Item = LayoutId>,
         cx: &mut App,
     ) -> LayoutId {
+        crate::frame_stats::bump(crate::frame_stats::NODES);
         self.invalidator.debug_assert_prepaint();
 
         cx.layout_id_buffer.clear();
@@ -5258,6 +5266,7 @@ impl Window {
         F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
             + 'static,
     {
+        crate::frame_stats::bump(crate::frame_stats::NODES);
         self.invalidator.debug_assert_prepaint();
 
         let rem_size = self.rem_size();

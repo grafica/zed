@@ -101,35 +101,43 @@ impl Scene {
             .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
         match &mut primitive {
             Primitive::Shadow(shadow) => {
+                crate::frame_stats::bump_primitive("Shadow");
                 shadow.order = order;
                 self.shadows.push(*shadow);
             }
             Primitive::Quad(quad) => {
+                crate::frame_stats::bump_primitive("Quad");
                 quad.order = order;
                 self.quads.push(*quad);
             }
             Primitive::Path(path) => {
+                crate::frame_stats::bump_primitive("Path");
                 path.order = order;
                 path.id = PathId(self.paths.len());
                 self.paths.push(path.clone());
             }
             Primitive::Underline(underline) => {
+                crate::frame_stats::bump_primitive("Underline");
                 underline.order = order;
                 self.underlines.push(*underline);
             }
             Primitive::MonochromeSprite(sprite) => {
+                crate::frame_stats::bump_primitive("MonochromeSprite");
                 sprite.order = order;
                 self.monochrome_sprites.push(*sprite);
             }
             Primitive::SubpixelSprite(sprite) => {
+                crate::frame_stats::bump_primitive("SubpixelSprite");
                 sprite.order = order;
                 self.subpixel_sprites.push(*sprite);
             }
             Primitive::PolychromeSprite(sprite) => {
+                crate::frame_stats::bump_primitive("PolychromeSprite");
                 sprite.order = order;
                 self.polychrome_sprites.push(*sprite);
             }
             Primitive::Surface(surface) => {
+                crate::frame_stats::bump_primitive("Surface");
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
