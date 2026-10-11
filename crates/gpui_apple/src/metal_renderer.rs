@@ -448,6 +448,19 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        self.draw_with_pre_commit(scene, &mut |_, _| {});
+    }
+
+    /// [`Self::draw`], calling `pre_commit` with the frame's command buffer after every
+    /// render pass is encoded and immediately before the buffer is presented and committed,
+    /// so a caller can encode more work (a compute pass) into the frame's own command
+    /// buffer, or add handlers to it. `pre_commit` must not commit the buffer. It is not
+    /// called when the frame is dropped (no drawable, or the scene failed to encode).
+    pub fn draw_with_pre_commit(
+        &mut self,
+        scene: &Scene,
+        pre_commit: &mut dyn FnMut(&metal::DeviceRef, &metal::CommandBufferRef),
+    ) {
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
@@ -479,6 +492,8 @@ impl MetalRenderer {
                 return;
             }
         };
+
+        pre_commit(&self.device, &command_buffer);
 
         if self.presents_with_transaction {
             command_buffer.commit();
