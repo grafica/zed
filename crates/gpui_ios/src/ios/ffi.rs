@@ -335,14 +335,23 @@ pub fn run_app_with_assets(asset_source: impl gpui::AssetSource) {
     gpui_ios_did_finish_launching(std::ptr::null_mut());
 }
 
-/// What a [`FrameHook`] is called with: once per drawn frame to encode, and once more when
-/// that frame's command buffer completes on the GPU.
+/// What a [`FrameHook`] is called with: twice per drawn frame to encode (before and after
+/// gpui's render passes), and once more when that frame's command buffer completes on the
+/// GPU. The encode phases are called on the thread gpui draws on (the main thread on iOS);
+/// work encoded into `command_buffer` there must not commit it.
 pub enum FramePhase<'a> {
-    /// The frame's command buffer after gpui has encoded every render pass, before it is
-    /// presented and committed. Encode more work into `command_buffer` (a compute encoder);
-    /// do not commit it. Called on the thread gpui draws on (the main thread on iOS).
-    Encode {
-        /// Frames this hook has been offered, from 0; [`FrameTiming::frame`] repeats it.
+    /// The frame's command buffer just after it is created, before gpui's first render
+    /// encoder (the scene's instance buffers are already written): work encoded here runs
+    /// on the GPU ahead of the draw.
+    BeforeRender {
+        /// Frames this hook has been offered, from 0; the frame's other phases repeat it.
+        frame: u64,
+        device: &'a metal::DeviceRef,
+        command_buffer: &'a metal::CommandBufferRef,
+    },
+    /// The same command buffer after gpui has encoded every render pass, before it is
+    /// presented and committed: work encoded here runs behind the draw.
+    AfterRender {
         frame: u64,
         device: &'a metal::DeviceRef,
         command_buffer: &'a metal::CommandBufferRef,
@@ -356,11 +365,13 @@ pub enum FramePhase<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct FrameTiming {
     pub frame: u64,
-    /// Sampled after the hook's [`FramePhase::Encode`] returns, immediately before gpui
+    /// Sampled after the hook's [`FramePhase::AfterRender`] returns, immediately before gpui
     /// presents the drawable and commits the buffer.
     pub commit_host_s: f64,
     /// The command buffer's `GPUStartTime`: gpui's render passes and anything the hook
-    /// encoded are one span.
+    /// encoded are one span. Timing the hook's encoder apart from the draw needs a counter
+    /// sample buffer (`MTLCounterSampleBuffer`, sampled at the encoder's stage boundaries),
+    /// which this measurement hook does not set up.
     pub gpu_start_s: f64,
     /// The command buffer's `GPUEndTime`.
     pub gpu_end_s: f64,
@@ -377,9 +388,9 @@ static FRAME_HOOK: parking_lot::Mutex<Option<FrameHook>> = parking_lot::Mutex::n
 static FRAME_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Registers (`Some`) or removes (`None`) the frame hook, called for every frame gpui draws
-/// in any window: [`FramePhase::Encode`] with the frame's own command buffer before it is
-/// committed, then [`FramePhase::Completed`] with its GPU span. With no hook registered a
-/// frame pays one uncontended lock.
+/// in any window: [`FramePhase::BeforeRender`] and [`FramePhase::AfterRender`] with the
+/// frame's own command buffer before it is committed, then [`FramePhase::Completed`] with
+/// its GPU span. With no hook registered a frame pays two uncontended locks.
 ///
 /// This is a MEASUREMENT hook: it lets an app put a compute pass into gpui's command buffer
 /// (paying no second commit and no second GPU wake) and see how long gpui's own draw
@@ -421,14 +432,32 @@ pub fn host_seconds() -> f64 {
 }
 
 /// Runs the registered frame hook on one frame's command buffer; the window's draw calls it
-/// between gpui's last render pass and the commit.
-pub(crate) fn run_frame_hook(device: &metal::DeviceRef, command_buffer: &metal::CommandBufferRef) {
+/// through [`gpui_apple::metal_renderer::MetalRenderer::draw_with_frame_hook`].
+pub(crate) fn run_frame_hook(
+    pass: gpui_apple::metal_renderer::FramePass,
+    device: &metal::DeviceRef,
+    command_buffer: &metal::CommandBufferRef,
+) {
+    use gpui_apple::metal_renderer::FramePass;
+    use std::sync::atomic::Ordering;
     let mut slot = FRAME_HOOK.lock();
     let Some(hook) = slot.as_mut() else {
         return;
     };
-    let frame = FRAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    hook(FramePhase::Encode {
+    // gpui draws on one thread, so a frame's AfterRender follows its own BeforeRender.
+    let frame = match pass {
+        FramePass::BeforeRender => {
+            let frame = FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
+            hook(FramePhase::BeforeRender {
+                frame,
+                device,
+                command_buffer,
+            });
+            return;
+        }
+        FramePass::AfterRender => FRAME_COUNT.load(Ordering::Relaxed).saturating_sub(1),
+    };
+    hook(FramePhase::AfterRender {
         frame,
         device,
         command_buffer,

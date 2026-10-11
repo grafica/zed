@@ -1130,7 +1130,7 @@ impl PlatformWindow for IosWindow {
     fn draw(&self, scene: &Scene) {
         self.renderer
             .lock()
-            .draw_with_pre_commit(scene, &mut super::ffi::run_frame_hook);
+            .draw_with_frame_hook(scene, &mut super::ffi::run_frame_hook);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
