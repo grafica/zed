@@ -341,13 +341,17 @@ pub fn run_app_with_assets(asset_source: impl gpui::AssetSource) {
 /// work encoded into `command_buffer` there must not commit it.
 pub enum FramePhase<'a> {
     /// The frame's command buffer just after it is created, before gpui's first render
-    /// encoder (the scene's instance buffers are already written): work encoded here runs
-    /// on the GPU ahead of the draw.
+    /// encoder (the scene's instance buffers are already written). Work encoded here is
+    /// unordered against the draw and may overlap it, unless the hook sets `fence`.
     BeforeRender {
         /// Frames this hook has been offered, from 0; the frame's other phases repeat it.
         frame: u64,
         device: &'a metal::DeviceRef,
         command_buffer: &'a metal::CommandBufferRef,
+        /// `None` on entry. Set it to order the hook's work ahead of the draw: gpui's first
+        /// render encoder (the clear pass on the drawable) then waits for this fence before
+        /// its vertex stage, so the hook's encoder must `update_fence` it.
+        fence: &'a mut Option<metal::Fence>,
     },
     /// The same command buffer after gpui has encoded every render pass, before it is
     /// presented and committed: work encoded here runs behind the draw.
@@ -437,23 +441,23 @@ pub(crate) fn run_frame_hook(
     pass: gpui_apple::metal_renderer::FramePass,
     device: &metal::DeviceRef,
     command_buffer: &metal::CommandBufferRef,
-) {
+) -> Option<metal::Fence> {
     use gpui_apple::metal_renderer::FramePass;
     use std::sync::atomic::Ordering;
     let mut slot = FRAME_HOOK.lock();
-    let Some(hook) = slot.as_mut() else {
-        return;
-    };
+    let hook = slot.as_mut()?;
     // gpui draws on one thread, so a frame's AfterRender follows its own BeforeRender.
     let frame = match pass {
         FramePass::BeforeRender => {
             let frame = FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
+            let mut fence = None;
             hook(FramePhase::BeforeRender {
                 frame,
                 device,
                 command_buffer,
+                fence: &mut fence,
             });
-            return;
+            return fence;
         }
         FramePass::AfterRender => FRAME_COUNT.load(Ordering::Relaxed).saturating_sub(1),
     };
@@ -495,4 +499,5 @@ pub(crate) fn run_frame_hook(
     unsafe {
         let _: () = objc2::msg_send![buffer, addCompletedHandler: &*block];
     }
+    None
 }
