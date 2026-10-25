@@ -8,61 +8,53 @@
 //! - Touch-based input instead of mouse
 //! - System keyboard handling differs significantly
 
-use super::{IosDispatcher, IosDisplay, IosWindow};
-use anyhow::{Context as _, anyhow};
-use core_foundation::{
-    base::{CFType, CFTypeRef, OSStatus, TCFType},
-    boolean::CFBoolean,
-    data::CFData,
-    dictionary::{CFDictionary, CFDictionaryRef, CFMutableDictionary},
-    string::{CFString, CFStringRef},
+use super::{CallbackSlot, application::IosApplicationState};
+use super::{IosDisplay, IosWindow};
+use anyhow::anyhow;
+use block2::RcBlock;
+use futures::{
+    StreamExt,
+    channel::{mpsc, oneshot},
 };
-use futures::channel::oneshot;
 use gpui::{
-    Action, ActivityGuard, AnyWindowHandle, AppLifecyclePhase, BackgroundExecutor, ClipboardItem,
-    CursorStyle, DummyKeyboardMapper, ForegroundExecutor, Keymap, Menu, MenuItem,
-    PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper,
-    PlatformTextSystem, PlatformWindow, Result, Task, ThermalState, WindowAppearance, WindowParams,
+    Action, AnyWindowHandle, AppLifecyclePhase, BackgroundExecutor, ClipboardItem, CursorStyle,
+    DummyKeyboardMapper, ForegroundExecutor, Keymap, Menu, MenuItem, PathPromptOptions, Platform,
+    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    PlatformWindow, Result, Task, ThermalState, WindowAppearance, WindowParams,
 };
-use objc2::runtime::{AnyObject, Bool};
-use objc2::{class, msg_send};
-use parking_lot::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use gpui_apple::{
+    AppleDispatcher, keychain, main_thread_marker,
+    thermal::{self, ThermalObserver},
+};
+use objc2::{MainThreadOnly, rc::Retained, runtime::ProtocolObject};
+use objc2_foundation::{
+    NSBundle, NSDictionary, NSNotification, NSNotificationCenter, NSObjectProtocol, NSString, NSURL,
+};
+use objc2_ui_kit::{
+    UIApplication, UIPasteboard, UIScreenModeDidChangeNotification, UITraitEnvironment,
+    UIUserInterfaceStyle, UIViewController,
+};
+#[allow(deprecated)]
+// Match UIScreen enumeration, including displays without a connected scene.
+use objc2_ui_kit::{UIScreenDidConnectNotification, UIScreenDidDisconnectNotification};
 use std::{
-    ffi::OsString,
+    cell::RefCell,
     path::{Path, PathBuf},
-    ptr,
     rc::Rc,
     sync::Arc,
 };
 
-/// Outstanding `prevent_idle_sleep` guards. See that method for why this is a count and
-/// why it is process-wide.
-static IDLE_SLEEP_PREVENTIONS: AtomicUsize = AtomicUsize::new(0);
-
-/// Set `UIApplication.idleTimerDisabled`, hopping to the main thread because it is UIKit.
-fn set_idle_timer_disabled(disabled: bool) {
-    super::dispatcher::run_on_main_thread(move || {
-        // SAFETY: `sharedApplication` is the process's UIApplication, and this runs on
-        // the main thread. It is null only before the application object exists, which
-        // is checked.
-        unsafe {
-            let app: *mut AnyObject = msg_send![class!(UIApplication), sharedApplication];
-            if app.is_null() {
-                return;
-            }
-            let _: () = msg_send![app, setIdleTimerDisabled: Bool::new(disabled)];
-        }
-    });
-}
-
-pub struct IosPlatform(Mutex<IosPlatformState>);
+pub struct IosPlatform(Rc<IosPlatformState>);
 
 pub(crate) struct IosPlatformState {
+    pub(super) application: IosApplicationState,
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
-    thermal_state_callback: Option<Box<dyn FnMut()>>,
+    thermal_observer: RefCell<Option<ThermalObserver>>,
+    display_observers: RefCell<Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>>,
+    display_task: RefCell<Option<Task<()>>>,
+    displays_changed_callback: CallbackSlot<Box<dyn FnMut()>>,
 }
 
 impl Default for IosPlatform {
@@ -73,105 +65,104 @@ impl Default for IosPlatform {
 
 impl IosPlatform {
     pub fn new() -> Self {
-        let dispatcher = Arc::new(IosDispatcher);
+        let dispatcher = Arc::new(AppleDispatcher::new());
 
-        let text_system: Arc<dyn PlatformTextSystem> = Arc::new(super::IosTextSystem::new());
+        let text_system: Arc<dyn PlatformTextSystem> = Arc::new(gpui_apple::AppleTextSystem::new());
 
-        Self(Mutex::new(IosPlatformState {
+        let state = Rc::new(IosPlatformState {
+            application: IosApplicationState::default(),
             background_executor: BackgroundExecutor::new(dispatcher.clone()),
             foreground_executor: ForegroundExecutor::new(dispatcher),
             text_system,
-            thermal_state_callback: None,
-        }))
-    }
-
-    fn root_view_controller() -> Option<*mut AnyObject> {
+            thermal_observer: RefCell::new(None),
+            display_observers: RefCell::new(Vec::new()),
+            display_task: RefCell::new(None),
+            displays_changed_callback: CallbackSlot::default(),
+        });
+        let (sender, mut receiver) = mpsc::unbounded();
+        let block = RcBlock::new(move |_: std::ptr::NonNull<NSNotification>| {
+            if sender.unbounded_send(()).is_err() {
+                log::debug!("display observer stopped before notification delivery");
+            }
+        });
+        // UIKit may deliver these synchronously. Defer entering GPUI until the
+        // current native callback has unwound, as with thermal notifications.
+        #[allow(deprecated)] // Screen enumeration is independent of our single connected scene.
         unsafe {
-            let scene = super::ffi::window_scene();
-            if scene.is_null() {
-                return None;
-            }
-
-            let windows: *mut AnyObject = msg_send![scene, windows];
-            if windows.is_null() {
-                return None;
-            }
-
-            let count: usize = msg_send![windows, count];
-            let mut fallback_window: *mut AnyObject = ptr::null_mut();
-            for index in 0..count {
-                let window: *mut AnyObject = msg_send![windows, objectAtIndex: index];
-                if fallback_window.is_null() {
-                    fallback_window = window;
-                }
-
-                let is_key_window: bool = msg_send![window, isKeyWindow];
-                if is_key_window {
-                    let view_controller: *mut AnyObject = msg_send![window, rootViewController];
-                    return (!view_controller.is_null()).then_some(view_controller);
-                }
-            }
-
-            if fallback_window.is_null() {
-                return None;
-            }
-
-            let view_controller: *mut AnyObject = msg_send![fallback_window, rootViewController];
-            (!view_controller.is_null()).then_some(view_controller)
-        }
-    }
-
-    fn presented_view_controller() -> Option<*mut AnyObject> {
-        unsafe {
-            let mut view_controller = Self::root_view_controller()?;
-            loop {
-                let presented: *mut AnyObject = msg_send![view_controller, presentedViewController];
-                if presented.is_null() {
-                    return Some(view_controller);
-                }
-                view_controller = presented;
+            for name in [
+                UIScreenDidConnectNotification,
+                UIScreenDidDisconnectNotification,
+                UIScreenModeDidChangeNotification,
+            ] {
+                let observer = NSNotificationCenter::defaultCenter()
+                    .addObserverForName_object_queue_usingBlock(Some(name), None, None, &block);
+                state.display_observers.borrow_mut().push(observer);
             }
         }
+        let weak_state = Rc::downgrade(&state);
+        let task = state.foreground_executor.spawn(async move {
+            while receiver.next().await.is_some() {
+                if let Some(state) = weak_state.upgrade() {
+                    state.displays_changed_callback.with(|callback| callback());
+                }
+            }
+        });
+        state.display_task.replace(Some(task));
+        Self(state)
     }
 
-    fn dismiss_presented_browser() {
-        unsafe {
-            let mut view_controller = match Self::root_view_controller() {
-                Some(view_controller) => view_controller,
-                None => return,
+    fn root_view_controller(&self) -> Option<Retained<UIViewController>> {
+        let window = if let Some(scene) = self.0.application.window_scene() {
+            let windows = scene.windows();
+            windows
+                .iter()
+                .find(|window| window.isKeyWindow())
+                .or_else(|| windows.firstObject())
+        } else {
+            // Legacy hosts can create a GPUI window without supplying a scene.
+            #[allow(deprecated)]
+            UIApplication::sharedApplication(
+                main_thread_marker().expect("UIKit requires the main thread"),
+            )
+            .keyWindow()
+        }?;
+        window.rootViewController()
+    }
+
+    fn presented_view_controller(&self) -> Option<Retained<UIViewController>> {
+        let mut view_controller = self.root_view_controller()?;
+        while let Some(presented) = view_controller.presentedViewController() {
+            view_controller = presented;
+        }
+        Some(view_controller)
+    }
+
+    fn dismiss_presented_browser(&self) {
+        let mut view_controller = match self.root_view_controller() {
+            Some(view_controller) => view_controller,
+            None => return,
+        };
+
+        loop {
+            let Some(presented) = view_controller.presentedViewController() else {
+                return;
             };
 
-            loop {
-                let presented: *mut AnyObject = msg_send![view_controller, presentedViewController];
-                if presented.is_null() {
-                    return;
-                }
-
-                let is_browser: bool =
-                    msg_send![presented, isKindOfClass: class!(SFSafariViewController)];
-                if is_browser {
-                    let _: () = msg_send![
-                        presented,
-                        dismissViewControllerAnimated: true,
-                        completion: ptr::null::<AnyObject>()
-                    ];
-                    return;
-                }
-
-                view_controller = presented;
+            if presented.downcast_ref::<SFSafariViewController>().is_some() {
+                presented.dismissViewControllerAnimated_completion(true, None);
+                return;
             }
+
+            view_controller = presented;
         }
     }
 
-    fn open_url_with_system(url: *mut AnyObject) {
+    fn open_url_with_system(url: &NSURL) {
         unsafe {
-            let app: *mut AnyObject = msg_send![class!(UIApplication), sharedApplication];
-            let _: () = msg_send![
-                app,
-                openURL: url,
-                options: ptr::null::<AnyObject>(),
-                completionHandler: ptr::null::<AnyObject>()
-            ];
+            let app = UIApplication::sharedApplication(
+                main_thread_marker().expect("UIKit requires the main thread"),
+            );
+            app.openURL_options_completionHandler(url, &NSDictionary::new(), None);
         }
     }
 }
@@ -190,20 +181,31 @@ impl PlatformKeyboardLayout for IosKeyboardLayout {
 }
 
 impl Platform for IosPlatform {
+    fn platform_info(&self) -> gpui::PlatformInfo {
+        gpui::PlatformInfo {
+            os: gpui::OperatingSystem::Ios,
+            target: gpui::PlatformTarget::Native,
+        }
+    }
+
+    fn on_displays_changed(&self, callback: Box<dyn FnMut()>) {
+        self.0.displays_changed_callback.set(callback);
+    }
+
     fn background_executor(&self) -> BackgroundExecutor {
-        self.0.lock().background_executor.clone()
+        self.0.background_executor.clone()
     }
 
     fn foreground_executor(&self) -> ForegroundExecutor {
-        self.0.lock().foreground_executor.clone()
+        self.0.foreground_executor.clone()
     }
 
     fn text_system(&self) -> Arc<dyn PlatformTextSystem> {
-        self.0.lock().text_system.clone()
+        self.0.text_system.clone()
     }
 
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) {
-        super::ffi::set_finish_launching_callback(on_finish_launching);
+        super::application::run(&self.0, on_finish_launching);
     }
 
     fn quit(&self) {
@@ -212,13 +214,13 @@ impl Platform for IosPlatform {
         log::warn!("iOS apps cannot programmatically quit");
     }
 
-    fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<OsString>) {
+    fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<std::ffi::OsString>) {
         // iOS apps cannot restart themselves
         log::warn!("iOS apps cannot restart themselves");
     }
 
     fn activate(&self, _ignoring_other_apps: bool) {
-        Self::dismiss_presented_browser();
+        self.dismiss_presented_browser();
     }
 
     fn hide(&self) {
@@ -254,27 +256,18 @@ impl Platform for IosPlatform {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
-        let window = Box::new(IosWindow::new(handle, options)?);
-        // Register the window with FFI layer so Objective-C can access it for rendering
-        window.register_with_ffi();
+        let window = Box::new(IosWindow::new(handle, options, &self.0)?);
+        window.register();
         Ok(window)
     }
 
     fn window_appearance(&self) -> WindowAppearance {
         unsafe {
-            let style: i64 = {
-                let app: *mut AnyObject = msg_send![class!(UIApplication), sharedApplication];
-                let key_window: *mut AnyObject = msg_send![app, keyWindow];
-                if key_window.is_null() {
-                    return WindowAppearance::Light;
-                }
-                let trait_collection: *mut AnyObject = msg_send![key_window, traitCollection];
-                msg_send![trait_collection, userInterfaceStyle]
+            let Some(controller) = self.root_view_controller() else {
+                return WindowAppearance::Light;
             };
-
-            // UIUserInterfaceStyle: 0 = unspecified, 1 = light, 2 = dark
-            match style {
-                2 => WindowAppearance::Dark,
+            match controller.traitCollection().userInterfaceStyle() {
+                UIUserInterfaceStyle::Dark => WindowAppearance::Dark,
                 _ => WindowAppearance::Light,
             }
         }
@@ -282,35 +275,28 @@ impl Platform for IosPlatform {
 
     fn open_url(&self, url: &str) {
         unsafe {
-            let url_string = super::util::nsstring(url);
-            let native_url: *mut AnyObject = msg_send![class!(NSURL), URLWithString: url_string];
-            if native_url.is_null() {
+            let Some(native_url) = NSURL::URLWithString(&NSString::from_str(url)) else {
                 log::error!("GPUI iOS: Could not parse URL: {url}");
                 return;
-            }
+            };
 
             if url.starts_with("https://") || url.starts_with("http://") {
-                if let Some(view_controller) = Self::presented_view_controller() {
-                    let browser: *mut AnyObject = msg_send![class!(SFSafariViewController), alloc];
-                    let browser: *mut AnyObject = msg_send![browser, initWithURL: native_url];
-                    if !browser.is_null() {
-                        let _: () = msg_send![
-                            view_controller,
-                            presentViewController: browser,
-                            animated: true,
-                            completion: ptr::null::<AnyObject>()
-                        ];
-                        return;
-                    }
+                if let Some(view_controller) = self.presented_view_controller() {
+                    let browser = SFSafariViewController::init_with_url(
+                        SFSafariViewController::alloc(view_controller.mtm()),
+                        &native_url,
+                    );
+                    view_controller.presentViewController_animated_completion(&browser, true, None);
+                    return;
                 }
             }
 
-            Self::open_url_with_system(native_url);
+            Self::open_url_with_system(&native_url);
         }
     }
 
     fn on_open_urls(&self, callback: Box<dyn FnMut(Vec<String>)>) {
-        super::ffi::set_open_urls_callback(callback);
+        self.0.application.open_urls.set(callback);
     }
 
     fn register_url_scheme(&self, _url: &str) -> Task<Result<()>> {
@@ -360,9 +346,8 @@ impl Platform for IosPlatform {
     }
 
     fn on_quit(&self, mut callback: Box<dyn FnMut() -> bool>) {
-        // UIKit has no cancellable quit; run the callback for its side effects
-        // and discard the allow/deny verdict.
-        super::ffi::set_quit_callback(Box::new(move || {
+        self.0.application.quit.set(Box::new(move || {
+            // UIKit's termination notification cannot be vetoed.
             callback();
         }));
     }
@@ -373,12 +358,20 @@ impl Platform for IosPlatform {
 
     fn on_system_wake(&self, _callback: Box<dyn FnMut()>) {}
 
+    fn on_system_sleep(&self, _callback: Box<dyn FnMut()>) {}
+
+    fn prevent_idle_sleep(&self, _reason: &str) -> Task<Result<gpui::ActivityGuard>> {
+        Task::ready(Err(anyhow!(
+            "Idle sleep prevention is not implemented for iOS"
+        )))
+    }
+
     fn on_app_lifecycle(&self, callback: Box<dyn FnMut(AppLifecyclePhase)>) {
-        super::ffi::set_app_lifecycle_callback(callback);
+        self.0.application.app_lifecycle.set(callback);
     }
 
     fn on_memory_warning(&self, callback: Box<dyn FnMut()>) {
-        super::ffi::set_memory_warning_callback(callback);
+        self.0.application.memory_warning.set(callback);
     }
 
     fn set_menus(&self, _menus: Vec<Menu>, _keymap: &Keymap) {
@@ -403,16 +396,9 @@ impl Platform for IosPlatform {
     }
 
     fn app_path(&self) -> Result<PathBuf> {
-        unsafe {
-            let bundle: *mut AnyObject = msg_send![class!(NSBundle), mainBundle];
-            let path: *mut AnyObject = msg_send![bundle, bundlePath];
-            let utf8: *const i8 = msg_send![path, UTF8String];
-            if utf8.is_null() {
-                return Err(anyhow!("Failed to get bundle path"));
-            }
-            let path_str = std::ffi::CStr::from_ptr(utf8).to_str()?;
-            Ok(PathBuf::from(path_str))
-        }
+        Ok(PathBuf::from(
+            NSBundle::mainBundle().bundlePath().to_string(),
+        ))
     }
 
     fn path_for_auxiliary_executable(&self, name: &str) -> Result<PathBuf> {
@@ -435,138 +421,37 @@ impl Platform for IosPlatform {
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
-        unsafe {
-            let pasteboard: *mut AnyObject = msg_send![class!(UIPasteboard), generalPasteboard];
-            if let Some(text) = item.text() {
-                let ns_string = super::util::nsstring(&text);
-                let _: () = msg_send![pasteboard, setString: ns_string];
-            }
+        let pasteboard = UIPasteboard::generalPasteboard();
+        if let Some(text) = item.text() {
+            unsafe { pasteboard.setString(Some(&NSString::from_str(&text))) };
         }
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        unsafe {
-            let pasteboard: *mut AnyObject = msg_send![class!(UIPasteboard), generalPasteboard];
-            let string: *mut AnyObject = msg_send![pasteboard, string];
-            if string.is_null() {
-                return None;
-            }
-            let utf8: *const i8 = msg_send![string, UTF8String];
-            if utf8.is_null() {
-                return None;
-            }
-            let text = std::ffi::CStr::from_ptr(utf8).to_str().ok()?;
-            Some(ClipboardItem::new_string(text.to_string()))
-        }
+        let pasteboard = UIPasteboard::generalPasteboard();
+        Some(ClipboardItem::new_string(
+            unsafe { pasteboard.string() }?.to_string(),
+        ))
     }
 
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>> {
         let url = url.to_string();
         let username = username.to_string();
         let password = password.to_vec();
-        self.background_executor().spawn(async move {
-            unsafe {
-                use security::*;
-
-                let url = CFString::from(url.as_str());
-                let username = CFString::from(username.as_str());
-                let password = CFData::from_buffer(&password);
-
-                let mut query_attributes = CFMutableDictionary::with_capacity(2);
-                query_attributes.set(kSecClass as *const _, kSecClassInternetPassword as *const _);
-                query_attributes.set(kSecAttrServer as *const _, url.as_CFTypeRef());
-
-                let mut updated_attributes = CFMutableDictionary::with_capacity(2);
-                updated_attributes.set(kSecAttrAccount as *const _, username.as_CFTypeRef());
-                updated_attributes.set(kSecValueData as *const _, password.as_CFTypeRef());
-
-                let mut operation = "updating";
-                let mut status = SecItemUpdate(
-                    query_attributes.as_concrete_TypeRef(),
-                    updated_attributes.as_concrete_TypeRef(),
-                );
-                if status == ERR_SEC_ITEM_NOT_FOUND {
-                    operation = "creating";
-                    let mut new_item_attributes = CFMutableDictionary::with_capacity(4);
-                    new_item_attributes
-                        .set(kSecClass as *const _, kSecClassInternetPassword as *const _);
-                    new_item_attributes.set(kSecAttrServer as *const _, url.as_CFTypeRef());
-                    new_item_attributes.set(kSecAttrAccount as *const _, username.as_CFTypeRef());
-                    new_item_attributes.set(kSecValueData as *const _, password.as_CFTypeRef());
-                    status = SecItemAdd(new_item_attributes.as_concrete_TypeRef(), ptr::null_mut());
-                }
-                anyhow::ensure!(
-                    status == ERR_SEC_SUCCESS,
-                    "{operation} password failed: {status}"
-                );
-            }
-            Ok(())
-        })
+        self.background_executor()
+            .spawn(async move { Ok(keychain::write_credentials(&url, &username, &password)?) })
     }
 
     fn read_credentials(&self, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
         let url = url.to_string();
-        self.background_executor().spawn(async move {
-            let url = CFString::from(url.as_str());
-            let cf_true = CFBoolean::true_value().as_CFTypeRef();
-
-            unsafe {
-                use security::*;
-
-                let mut attributes = CFMutableDictionary::with_capacity(4);
-                attributes.set(kSecClass as *const _, kSecClassInternetPassword as *const _);
-                attributes.set(kSecAttrServer as *const _, url.as_CFTypeRef());
-                attributes.set(kSecReturnAttributes as *const _, cf_true);
-                attributes.set(kSecReturnData as *const _, cf_true);
-
-                let mut result = CFTypeRef::from(ptr::null());
-                let status = SecItemCopyMatching(attributes.as_concrete_TypeRef(), &mut result);
-                match status {
-                    ERR_SEC_SUCCESS => {}
-                    ERR_SEC_ITEM_NOT_FOUND | ERR_SEC_USER_CANCELED => return Ok(None),
-                    _ => anyhow::bail!("reading password failed: {status}"),
-                }
-
-                let result = CFType::wrap_under_create_rule(result)
-                    .downcast::<CFDictionary>()
-                    .context("keychain item was not a dictionary")?;
-                let username = result
-                    .find(kSecAttrAccount as *const _)
-                    .context("account was missing from keychain item")?;
-                let username = CFType::wrap_under_get_rule(*username)
-                    .downcast::<CFString>()
-                    .context("account was not a string")?;
-                let password = result
-                    .find(kSecValueData as *const _)
-                    .context("password was missing from keychain item")?;
-                let password = CFType::wrap_under_get_rule(*password)
-                    .downcast::<CFData>()
-                    .context("password was not data")?;
-
-                Ok(Some((username.to_string(), password.bytes().to_vec())))
-            }
-        })
+        self.background_executor()
+            .spawn(async move { Ok(keychain::read_credentials(&url)?) })
     }
 
     fn delete_credentials(&self, url: &str) -> Task<Result<()>> {
         let url = url.to_string();
-        self.background_executor().spawn(async move {
-            unsafe {
-                use security::*;
-
-                let url = CFString::from(url.as_str());
-                let mut query_attributes = CFMutableDictionary::with_capacity(2);
-                query_attributes.set(kSecClass as *const _, kSecClassInternetPassword as *const _);
-                query_attributes.set(kSecAttrServer as *const _, url.as_CFTypeRef());
-
-                let status = SecItemDelete(query_attributes.as_concrete_TypeRef());
-                anyhow::ensure!(
-                    matches!(status, ERR_SEC_SUCCESS | ERR_SEC_ITEM_NOT_FOUND),
-                    "deleting password failed: {status}"
-                );
-            }
-            Ok(())
-        })
+        self.background_executor()
+            .spawn(async move { Ok(keychain::delete_credentials(&url)?) })
     }
 
     fn on_keyboard_layout_change(&self, _callback: Box<dyn FnMut()>) {
@@ -574,38 +459,12 @@ impl Platform for IosPlatform {
     }
 
     fn thermal_state(&self) -> ThermalState {
-        // iOS provides thermal state via ProcessInfo
-        // For now, return nominal
-        ThermalState::Nominal
+        thermal::thermal_state()
     }
 
     fn on_thermal_state_change(&self, callback: Box<dyn FnMut()>) {
-        self.0.lock().thermal_state_callback = Some(callback);
-        // In a full implementation, we would register for
-        // NSProcessInfoThermalStateDidChangeNotification
-    }
-
-    /// Keep the display awake while any guard returned by this method is alive.
-    ///
-    /// iOS has no `NSProcessInfo` equivalent that reaches the display: what macOS does
-    /// here (`beginActivityWithOptions:`) governs app napping and sudden termination and
-    /// does NOT stop the screen locking, so mirroring it would under-deliver on the
-    /// method's name. `UIApplication.idleTimerDisabled` is the mechanism that does what
-    /// the trait promises.
-    ///
-    /// REFCOUNTED, because the flag is a single process-wide boolean and the guards are
-    /// not: two overlapping callers clearing it independently would let the screen lock
-    /// while the second still wanted it awake. The count is process-wide for the same
-    /// reason the flag is.
-    fn prevent_idle_sleep(&self, _reason: &str) -> Task<Result<ActivityGuard>> {
-        if IDLE_SLEEP_PREVENTIONS.fetch_add(1, Ordering::SeqCst) == 0 {
-            set_idle_timer_disabled(true);
-        }
-        Task::ready(Ok(ActivityGuard::new(|| {
-            if IDLE_SLEEP_PREVENTIONS.fetch_sub(1, Ordering::SeqCst) == 1 {
-                set_idle_timer_disabled(false);
-            }
-        })))
+        let observer = ThermalObserver::new(&self.0.foreground_executor, callback);
+        self.0.thermal_observer.replace(Some(observer));
     }
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
@@ -617,28 +476,33 @@ impl Platform for IosPlatform {
     }
 }
 
-mod security {
-    #![allow(non_upper_case_globals)]
-
-    use super::*;
-
-    #[link(name = "Security", kind = "framework")]
-    unsafe extern "C" {
-        pub static kSecClass: CFStringRef;
-        pub static kSecClassInternetPassword: CFStringRef;
-        pub static kSecAttrServer: CFStringRef;
-        pub static kSecAttrAccount: CFStringRef;
-        pub static kSecValueData: CFStringRef;
-        pub static kSecReturnAttributes: CFStringRef;
-        pub static kSecReturnData: CFStringRef;
-
-        pub fn SecItemAdd(attributes: CFDictionaryRef, result: *mut CFTypeRef) -> OSStatus;
-        pub fn SecItemUpdate(query: CFDictionaryRef, attributes: CFDictionaryRef) -> OSStatus;
-        pub fn SecItemDelete(query: CFDictionaryRef) -> OSStatus;
-        pub fn SecItemCopyMatching(query: CFDictionaryRef, result: *mut CFTypeRef) -> OSStatus;
+impl Drop for IosPlatformState {
+    fn drop(&mut self) {
+        for observer in self.display_observers.get_mut().drain(..) {
+            unsafe { NSNotificationCenter::defaultCenter().removeObserver(observer.as_ref()) };
+        }
     }
+}
 
-    pub const ERR_SEC_SUCCESS: OSStatus = 0;
-    pub const ERR_SEC_USER_CANCELED: OSStatus = -128;
-    pub const ERR_SEC_ITEM_NOT_FOUND: OSStatus = -25300;
+// objc2-safari-services 0.3.2 only includes the macOS SafariServices API.
+// Keep the missing iOS initializer typed here until the generated crate includes it.
+#[link(name = "SafariServices", kind = "framework")]
+unsafe extern "C" {}
+
+objc2::extern_class!(
+    #[unsafe(super(
+        UIViewController,
+        objc2_ui_kit::UIResponder,
+        objc2_foundation::NSObject
+    ))]
+    #[thread_kind = MainThreadOnly]
+    struct SFSafariViewController;
+);
+
+impl SFSafariViewController {
+    objc2::extern_methods!(
+        #[unsafe(method(initWithURL:))]
+        #[unsafe(method_family = init)]
+        unsafe fn init_with_url(this: objc2::rc::Allocated<Self>, url: &NSURL) -> Retained<Self>;
+    );
 }

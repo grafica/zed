@@ -3,20 +3,22 @@ use crate::{
     IntoElement, LayoutId, Length, ObjectFit, Pixels, Style, StyleRefinement, Styled, Window, px,
 };
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-use core_video::pixel_buffer::CVPixelBuffer;
+use objc2_core_foundation::CFRetained;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use objc2_core_video::{CVPixelBuffer, CVPixelBufferGetHeight, CVPixelBufferGetWidth};
 use refineable::Refineable;
 
 /// A source of a surface's content.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SurfaceSource {
-    /// A macOS image buffer from CoreVideo
+    /// A CoreVideo image buffer
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    Surface(CVPixelBuffer),
+    Surface(CFRetained<CVPixelBuffer>),
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-impl From<CVPixelBuffer> for SurfaceSource {
-    fn from(value: CVPixelBuffer) -> Self {
+impl From<CFRetained<CVPixelBuffer>> for SurfaceSource {
+    fn from(value: CFRetained<CVPixelBuffer>) -> Self {
         SurfaceSource::Surface(value)
     }
 }
@@ -78,8 +80,8 @@ impl Element for Surface {
         {
             let SurfaceSource::Surface(buffer) = &self.source;
             let size = crate::size(
-                px(buffer.get_width() as f32),
-                px(buffer.get_height() as f32),
+                px(CVPixelBufferGetWidth(buffer) as f32),
+                px(CVPixelBufferGetHeight(buffer) as f32),
             );
             if size.width > px(0.) && size.height > px(0.) {
                 if style.aspect_ratio.is_none() {
@@ -125,16 +127,27 @@ impl Element for Surface {
         &mut self,
         _global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] bounds: Bounds<Pixels>,
+        #[cfg_attr(
+            not(any(target_os = "macos", target_os = "ios")),
+            allow(unused_variables)
+        )]
+        bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
-        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] window: &mut Window,
+        #[cfg_attr(
+            not(any(target_os = "macos", target_os = "ios")),
+            allow(unused_variables)
+        )]
+        window: &mut Window,
         _: &mut App,
     ) {
         match &self.source {
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             SurfaceSource::Surface(surface) => {
-                let size = crate::size(surface.get_width().into(), surface.get_height().into());
+                let size = crate::size(
+                    CVPixelBufferGetWidth(surface).into(),
+                    CVPixelBufferGetHeight(surface).into(),
+                );
                 let new_bounds = self.object_fit.get_bounds(bounds, size);
                 // TODO: Add support for corner_radii
                 window.paint_surface(new_bounds, surface.clone());
