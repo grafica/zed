@@ -155,7 +155,7 @@ pub fn frame_done() {
         return;
     }
     let d = C[DRAWS].fetch_add(1, Relaxed) + 1;
-    if d % EVERY != 0 {
+    if !d.is_multiple_of(EVERY) {
         return;
     }
     let mut line = format!("gpui-stats,draws={d}");
