@@ -3,6 +3,7 @@
 mod application;
 mod display;
 mod events;
+pub mod frame_hook;
 mod platform;
 mod text_input;
 mod window;

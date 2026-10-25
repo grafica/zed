@@ -40,6 +40,23 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 
+/// Where in a frame's command buffer [`MetalRenderer::draw_with_frame_hook`] calls its hook.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FramePass {
+    /// Before gpui's first render encoder. Work encoded here is unordered against the draw
+    /// (it may overlap it) unless the hook returns a fence; see [`FrameHookFn`].
+    BeforeRender,
+    /// After gpui's last render pass, before present and commit: work runs behind the draw.
+    AfterRender,
+}
+
+/// The hook [`MetalRenderer::draw_with_frame_hook`] calls. A fence returned from
+/// [`FramePass::BeforeRender`] orders the hook's work ahead of the draw: the frame's first
+/// render encoder (the clear pass on the drawable) waits for it before its vertex stage, so
+/// the hook's encoder must `update_fence` it. What `AfterRender` returns is ignored.
+pub type FrameHookFn<'a> =
+    dyn FnMut(FramePass, &metal::DeviceRef, &metal::CommandBufferRef) -> Option<metal::Fence> + 'a;
+
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
 
@@ -518,6 +535,17 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        self.draw_with_frame_hook(scene, &mut |_, _, _| None);
+    }
+
+    /// [`Self::draw`], calling `hook` twice with the frame's command buffer so a caller can
+    /// encode more work (a compute pass) into it: [`FramePass::BeforeRender`] right after
+    /// the buffer is created, before gpui's first render encoder (the scene's instances are
+    /// already written), and [`FramePass::AfterRender`] after every render pass is encoded,
+    /// immediately before the buffer is presented and committed. `hook` must not commit
+    /// the buffer. If the scene fails to encode, the frame is dropped after `BeforeRender`
+    /// without `AfterRender`; with no drawable, neither is called.
+    pub fn draw_with_frame_hook(&mut self, scene: &Scene, hook: &mut FrameHookFn<'_>) {
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
@@ -542,13 +570,16 @@ impl MetalRenderer {
             return;
         };
 
-        let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
+        let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size, hook)
+        {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
                 log::error!("failed to render: {error:#}");
                 return;
             }
         };
+
+        hook(FramePass::AfterRender, &self.device, &command_buffer);
 
         if self.presents_with_transaction {
             command_buffer.commit();
@@ -565,6 +596,7 @@ impl MetalRenderer {
         scene: &Scene,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
+        hook: &mut FrameHookFn<'_>,
     ) -> Result<metal::CommandBuffer> {
         let mut writer = InstanceBufferWriter::new(
             &self.device,
@@ -589,6 +621,7 @@ impl MetalRenderer {
             &mut writer,
             texture,
             viewport_size,
+            hook,
         )?;
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
@@ -627,7 +660,10 @@ impl MetalRenderer {
             .next_drawable()
             .ok_or_else(|| anyhow::anyhow!("Failed to get drawable for render_to_image"))?;
 
-        let command_buffer = self.render_frame(scene, drawable.texture(), viewport_size)?;
+        let command_buffer =
+            self.render_frame(scene, drawable.texture(), viewport_size, &mut |_, _, _| {
+                None
+            })?;
 
         // Commit and wait for completion without presenting
         command_buffer.commit();
@@ -674,7 +710,8 @@ impl MetalRenderer {
             });
             let target_texture = self.device.new_texture(&texture_descriptor);
 
-            let command_buffer = self.render_frame(scene, &target_texture, size)?;
+            let command_buffer =
+                self.render_frame(scene, &target_texture, size, &mut |_, _, _| None)?;
 
             // Managed textures require an explicit blit synchronize before the CPU
             // can read back the rendered data. Without this, get_bytes returns
@@ -728,7 +765,8 @@ impl MetalRenderer {
                 .clone()
                 .expect("just ensured the render target exists");
 
-            let command_buffer = self.render_frame(scene, &target_texture, size)?;
+            let command_buffer =
+                self.render_frame(scene, &target_texture, size, &mut |_, _, _| None)?;
 
             // Commit without waiting, mirroring presentation to a real window where
             // the CPU doesn't block on the GPU.
@@ -744,9 +782,11 @@ impl MetalRenderer {
         writer: &mut InstanceBufferWriter,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
+        hook: &mut FrameHookFn<'_>,
     ) -> Result<metal::CommandBuffer> {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
+        let before_render_fence = hook(FramePass::BeforeRender, &self.device, command_buffer);
         let alpha = if self.opaque { 1. } else { 0. };
 
         let mut command_encoder = new_command_encoder_for_texture(
@@ -755,6 +795,9 @@ impl MetalRenderer {
             viewport_size,
             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
         );
+        if let Some(fence) = &before_render_fence {
+            command_encoder.wait_for_fence(fence, metal::MTLRenderStages::Vertex);
+        }
 
         for batch in scene.batches() {
             gpui::frame_stats::bump(gpui::frame_stats::BATCHES);
