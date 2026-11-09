@@ -61,6 +61,7 @@ mod apple_build {
             "PathSprite".into(),
             "SurfaceInputIndex".into(),
             "SurfaceBounds".into(),
+            "SurfaceTransform".into(),
             "TransformationMatrix".into(),
         ]);
         config.no_includes = true;

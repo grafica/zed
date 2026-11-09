@@ -771,12 +771,43 @@ impl From<PolychromeSprite> for Primitive {
     }
 }
 
+/// A projective transform of a surface's quad, in scaled pixels: row-major 3x3, taking a
+/// position `(x, y, 1)` to `(x', y', w)`, shown at `(x' / w, y' / w)`. The vertex shader carries
+/// `w` into the clip position, so the texture is interpolated perspective-correctly across the
+/// quad: a homography of the surface, exact, with the same two triangles. The unit transform
+/// draws the surface in its bounds as before.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(C)]
+pub struct SurfaceTransform {
+    /// The matrix's rows.
+    pub rows: [[f32; 3]; 3],
+}
+
+impl Eq for SurfaceTransform {}
+
+impl SurfaceTransform {
+    /// The unit matrix, has no effect.
+    pub fn unit() -> Self {
+        Self {
+            rows: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        }
+    }
+
+    /// Whether this is the unit matrix.
+    pub fn is_unit(&self) -> bool {
+        *self == Self::unit()
+    }
+}
+
 #[derive(Clone, Debug)]
 #[allow(missing_docs)]
 pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    /// The transform the quad is drawn through ([`SurfaceTransform`]); the unit for the bounds
+    /// as they are.
+    pub transform: SurfaceTransform,
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub image_buffer: objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer>,
 }

@@ -20,6 +20,13 @@ float4 distance_from_clip_rect(float2 unit_vertex, Bounds_ScaledPixels bounds,
                                Bounds_ScaledPixels clip_bounds);
 float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
                                Bounds_ScaledPixels clip_bounds, TransformationMatrix transformation);
+float3 surface_projected(float2 unit_vertex, Bounds_ScaledPixels bounds,
+                         SurfaceTransform transform);
+float4 to_device_position_projective(float2 unit_vertex, Bounds_ScaledPixels bounds,
+                                     SurfaceTransform transform,
+                                     constant Size_DevicePixels *input_viewport_size);
+float4 distance_from_clip_rect_projective(float2 unit_vertex, Bounds_ScaledPixels bounds,
+                                          Bounds_ScaledPixels clip_bounds, SurfaceTransform transform);
 float corner_dash_velocity(float dv1, float dv2);
 float dash_alpha(float t, float period, float length, float dash_velocity,
                  float antialias_threshold);
@@ -868,10 +875,13 @@ vertex SurfaceVertexOutput surface_vertex(
     [[buffer(SurfaceInputIndex_TextureSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   SurfaceBounds surface = surfaces[surface_id];
-  float4 device_position =
-      to_device_position(unit_vertex, surface.bounds, viewport_size);
-  float4 clip_distance = distance_from_clip_rect(unit_vertex, surface.bounds,
-                                                 surface.content_mask.bounds);
+  // The quad through the surface's projective transform (the unit for the bounds as they
+  // are): the clip position keeps the transform's w, so the texture is interpolated
+  // perspective-correctly across the two triangles.
+  float4 device_position = to_device_position_projective(
+      unit_vertex, surface.bounds, surface.transform, viewport_size);
+  float4 clip_distance = distance_from_clip_rect_projective(
+      unit_vertex, surface.bounds, surface.content_mask.bounds, surface.transform);
   // We are going to copy the whole texture, so the texture position corresponds
   // to the current vertex of the unit triangle.
   float2 texture_position = unit_vertex;
@@ -1139,6 +1149,44 @@ float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixe
                 clip_bounds.origin.x + clip_bounds.size.width - transformed_position.x,
                 transformed_position.y - clip_bounds.origin.y,
                 clip_bounds.origin.y + clip_bounds.size.height - transformed_position.y);
+}
+
+// A surface quad's position through its projective transform: (x', y', w).
+float3 surface_projected(float2 unit_vertex, Bounds_ScaledPixels bounds,
+                         SurfaceTransform t) {
+  float2 position =
+      unit_vertex * float2(bounds.size.width, bounds.size.height) +
+      float2(bounds.origin.x, bounds.origin.y);
+  float3 p = float3(position, 1.0);
+  return float3(t.rows[0][0] * p.x + t.rows[0][1] * p.y + t.rows[0][2] * p.z,
+                t.rows[1][0] * p.x + t.rows[1][1] * p.y + t.rows[1][2] * p.z,
+                t.rows[2][0] * p.x + t.rows[2][1] * p.y + t.rows[2][2] * p.z);
+}
+
+// The clip position of a surface vertex through its transform, w kept: the rasterizer
+// divides by it, and interpolates the texture position perspective-correctly.
+float4 to_device_position_projective(float2 unit_vertex, Bounds_ScaledPixels bounds,
+                                     SurfaceTransform transform,
+                                     constant Size_DevicePixels *input_viewport_size) {
+  float3 t = surface_projected(unit_vertex, bounds, transform);
+  float2 viewport_size = float2((float)input_viewport_size->width,
+                                (float)input_viewport_size->height);
+  float2 device_position =
+      (t.xy / t.z) / viewport_size * float2(2., -2.) + float2(-1., 1.);
+  return float4(device_position * t.z, 0., t.z);
+}
+
+// The clip distances are interpolated in homogeneous space (linearly in the clip position,
+// before the divide), so a distance that is affine in the shown position must be multiplied
+// by w here: (x' / w - c) w = x' - c w, linear in (x', w), and the rasterizer's interpolation
+// and divide give the shown distance exactly across the perspective.
+float4 distance_from_clip_rect_projective(float2 unit_vertex, Bounds_ScaledPixels bounds,
+                                          Bounds_ScaledPixels clip_bounds, SurfaceTransform transform) {
+  float3 t = surface_projected(unit_vertex, bounds, transform);
+  return float4(t.x - clip_bounds.origin.x * t.z,
+                (clip_bounds.origin.x + clip_bounds.size.width) * t.z - t.x,
+                t.y - clip_bounds.origin.y * t.z,
+                (clip_bounds.origin.y + clip_bounds.size.height) * t.z - t.y);
 }
 
 float4 over(float4 below, float4 above) {
