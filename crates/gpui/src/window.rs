@@ -5182,6 +5182,22 @@ impl Window {
         bounds: Bounds<Pixels>,
         image_buffer: CFRetained<CVPixelBuffer>,
     ) {
+        self.paint_surface_transformed(bounds, crate::SurfaceTransform::unit(), image_buffer);
+    }
+
+    /// Paint a surface into the given bounds, its quad drawn through `transform`: a projective
+    /// 3x3 in scaled (device) pixels, as [`TransformationMatrix`] is for sprites, applied to the
+    /// quad's snapped positions ([`SurfaceTransform`](crate::SurfaceTransform)). The content mask
+    /// clips the transformed quad.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub fn paint_surface_transformed(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        transform: crate::SurfaceTransform,
+        image_buffer: CFRetained<CVPixelBuffer>,
+    ) {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();
@@ -5192,6 +5208,7 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
+            transform,
             image_buffer,
         });
     }

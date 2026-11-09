@@ -1543,6 +1543,7 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
         surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
             bounds: surface.bounds,
             content_mask: surface.content_mask,
+            transform: surface.transform,
         }))?,
     })
 }
@@ -1735,6 +1736,7 @@ pub struct PathSprite {
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub transform: gpui::SurfaceTransform,
 }
 
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -1828,6 +1830,7 @@ mod tests {
             order: 0,
             bounds,
             content_mask: ContentMask { bounds },
+            transform: gpui::SurfaceTransform::unit(),
             image_buffer: image_buffer.clone(),
         });
         drop(image_buffer);
@@ -1843,5 +1846,118 @@ mod tests {
             assert!(blue.abs_diff(128) <= 2);
             assert_eq!(*alpha, 255);
         }
+    }
+
+    /// A `w` x `h` 420f buffer with `luma(x, y)` in its Y plane and neutral chroma.
+    fn luma_buffer(
+        w: usize,
+        h: usize,
+        luma: impl Fn(usize, usize) -> u8,
+    ) -> CFRetained<objc2_core_video::CVPixelBuffer> {
+        let attributes = CFDictionary::from_slices(
+            &[unsafe { kCVPixelBufferIOSurfacePropertiesKey }],
+            &[&*CFDictionary::<CFType, CFType>::empty()],
+        );
+        let mut image_buffer = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                CVPixelBufferCreate(
+                    None,
+                    w,
+                    h,
+                    kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                    Some(attributes.as_opaque()),
+                    ptr::NonNull::from(&mut image_buffer),
+                )
+            },
+            kCVReturnSuccess
+        );
+        let image_buffer =
+            unsafe { CFRetained::from_raw(ptr::NonNull::new(image_buffer).unwrap()) };
+        unsafe {
+            assert_eq!(
+                CVPixelBufferLockBaseAddress(&image_buffer, CVPixelBufferLockFlags::empty()),
+                kCVReturnSuccess
+            );
+            let y = CVPixelBufferGetBaseAddressOfPlane(&image_buffer, 0).cast::<u8>();
+            let stride = CVPixelBufferGetBytesPerRowOfPlane(&image_buffer, 0);
+            for row in 0..h {
+                for col in 0..w {
+                    *y.add(row * stride + col) = luma(col, row);
+                }
+            }
+            let c = CVPixelBufferGetBaseAddressOfPlane(&image_buffer, 1).cast::<u8>();
+            let length = CVPixelBufferGetBytesPerRowOfPlane(&image_buffer, 1)
+                * CVPixelBufferGetHeightOfPlane(&image_buffer, 1);
+            slice::from_raw_parts_mut(c, length).fill(128);
+            assert_eq!(
+                CVPixelBufferUnlockBaseAddress(&image_buffer, CVPixelBufferLockFlags::empty()),
+                kCVReturnSuccess
+            );
+        }
+        image_buffer
+    }
+
+    /// The surface's quad through a projective transform: a 32 x 32 buffer bright on its left
+    /// half and dark on its right, drawn (a) as it is, (b) shifted 8 px right, (c) turned a
+    /// quarter turn about the centre, (d) through a perspective `w = 1 + x / 64`. The bright
+    /// and dark halves land where the transform puts them, read back from the headless render:
+    /// the shader divides by the transform's w and the texture follows.
+    #[test]
+    fn render_core_video_surface_through_a_projective_transform() {
+        let (w, h) = (32usize, 32usize);
+        let buffer = luma_buffer(w, h, |x, _| if x < w / 2 { 235 } else { 16 });
+        let bounds = Bounds {
+            origin: Point::default(),
+            size: size(ScaledPixels(32.0), ScaledPixels(32.0)),
+        };
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())));
+        let mut render = |rows: [[f32; 3]; 3], mask: Bounds<ScaledPixels>| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(PaintSurface {
+                order: 0,
+                bounds,
+                content_mask: ContentMask { bounds: mask },
+                transform: gpui::SurfaceTransform { rows },
+                image_buffer: buffer.clone(),
+            });
+            scene.finish();
+            renderer
+                .render_scene_to_image(&scene, size(DevicePixels(32), DevicePixels(32)))
+                .unwrap()
+        };
+        let bright = |img: &image::RgbaImage, x: u32, y: u32| img.get_pixel(x, y).0[0] > 200;
+        let dark = |img: &image::RgbaImage, x: u32, y: u32| img.get_pixel(x, y).0[0] < 60;
+
+        // (a) The unit transform: the boundary at column 16.
+        let img = render([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], bounds);
+        assert!(bright(&img, 4, 16) && bright(&img, 14, 16), "unit: the left half is bright");
+        assert!(dark(&img, 18, 16) && dark(&img, 28, 16), "unit: the right half is dark");
+
+        // (b) Shifted 8 px right: the boundary at column 24, the uncovered left strip not bright.
+        let img = render([[1.0, 0.0, 8.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], bounds);
+        assert!(bright(&img, 12, 16) && bright(&img, 22, 16), "shift: bright up to column 24");
+        assert!(dark(&img, 26, 16) && dark(&img, 30, 16), "shift: dark past it");
+        assert!(!bright(&img, 4, 16), "shift: the strip the quad left is not the bright half");
+
+        // (c) A quarter turn about (16, 16): (x, y) -> (16 - (y - 16), 16 + (x - 16)): the bright
+        // left half becomes the top half.
+        let img = render([[0.0, -1.0, 32.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], bounds);
+        assert!(bright(&img, 16, 4) && bright(&img, 8, 12), "turn: the top half is bright");
+        assert!(dark(&img, 16, 28) && dark(&img, 24, 20), "turn: the bottom half is dark");
+
+        // (d) Perspective: w = 1 + x / 64, a point (x, y) shown at (x, y) / w: the boundary
+        // (x = 16) at 12.8, the quad's right edge (x = 32) at 21.3 and shortened to 21.3 tall,
+        // its bottom edge running from (0, 32) to (21.3, 21.3). The texture follows the divide
+        // (the bright half ends at 12.8 on every row inside the quad), and the quad's shape is
+        // the trapezoid: inside at (20, 20) and (2, 30), outside at (20, 23) and (26, 10).
+        let img = render([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0 / 64.0, 0.0, 1.0]], bounds);
+        for y in [2u32, 10, 16] {
+            assert!(bright(&img, 6, y) && bright(&img, 11, y), "perspective: bright up to 12.8, row {y}");
+            assert!(dark(&img, 14, y) && dark(&img, 19, y), "perspective: dark from 12.8 to 21.3, row {y}");
+        }
+        let gone = |x: u32, y: u32| img.get_pixel(x, y).0[0] < 8;
+        assert!(dark(&img, 20, 20) && bright(&img, 2, 30), "perspective: inside the trapezoid");
+        assert!(gone(20, 23) && gone(26, 10) && gone(10, 31), "perspective: outside it");
     }
 }
