@@ -857,12 +857,16 @@ fragment float4 path_sprite_fragment(
 struct SurfaceVertexOutput {
   float4 position [[position]];
   float2 texture_position;
+  // 1 when the surface is drawn through a transform other than the unit: the fragment then
+  // samples the luma phase-independently (see surface_fragment).
+  float transformed [[flat]];
   float clip_distance [[clip_distance]][4];
 };
 
 struct SurfaceFragmentInput {
   float4 position [[position]];
   float2 texture_position;
+  float transformed [[flat]];
 };
 
 vertex SurfaceVertexOutput surface_vertex(
@@ -885,9 +889,14 @@ vertex SurfaceVertexOutput surface_vertex(
   // We are going to copy the whole texture, so the texture position corresponds
   // to the current vertex of the unit triangle.
   float2 texture_position = unit_vertex;
+  SurfaceTransform t = surface.transform;
+  bool unit = t.rows[0][0] == 1.0 && t.rows[0][1] == 0.0 && t.rows[0][2] == 0.0 &&
+              t.rows[1][0] == 0.0 && t.rows[1][1] == 1.0 && t.rows[1][2] == 0.0 &&
+              t.rows[2][0] == 0.0 && t.rows[2][1] == 0.0 && t.rows[2][2] == 1.0;
   return SurfaceVertexOutput{
       device_position,
       texture_position,
+      unit ? 0.0 : 1.0,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
@@ -902,9 +911,23 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
                float4(+0.0000f, -0.3441f, +1.7720f, +0.0000f),
                float4(+1.4020f, -0.7141f, +0.0000f, +0.0000f),
                float4(-0.7010f, +0.5291f, -0.8860f, +1.0000f));
-  float4 ycbcr = float4(
-      y_texture.sample(texture_sampler, input.texture_position).r,
-      cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
+  float2 p = input.texture_position;
+  float y;
+  if (input.transformed > 0.5) {
+    // Through a transform the surface moves across the screen by fractions of a texel from
+    // frame to frame, and a bilinear sample's sharpness goes with its phase: on fine texture
+    // magnified onto the screen that is a visible shimmer. Four taps a quarter texel apart,
+    // averaged (a half-texel box over the bilinear), make the sharpness the same at every
+    // phase, at a softening too small to see at the magnifications a camera frame is shown at.
+    float2 o = 0.25 / float2(y_texture.get_width(), y_texture.get_height());
+    y = 0.25 * (y_texture.sample(texture_sampler, p + float2(-o.x, -o.y)).r +
+                y_texture.sample(texture_sampler, p + float2(o.x, -o.y)).r +
+                y_texture.sample(texture_sampler, p + float2(-o.x, o.y)).r +
+                y_texture.sample(texture_sampler, p + float2(o.x, o.y)).r);
+  } else {
+    y = y_texture.sample(texture_sampler, p).r;
+  }
+  float4 ycbcr = float4(y, cb_cr_texture.sample(texture_sampler, p).rg, 1.0);
 
   return ycbcrToRGBTransform * ycbcr;
 }
