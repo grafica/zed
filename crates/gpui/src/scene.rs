@@ -46,6 +46,7 @@ pub struct Scene {
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
     pub underlines: Vec<Underline>,
+    pub line_segments: Vec<LineSegment>,
     pub monochrome_sprites: Vec<MonochromeSprite>,
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
@@ -62,6 +63,7 @@ impl Scene {
         self.shadows.clear();
         self.quads.clear();
         self.underlines.clear();
+        self.line_segments.clear();
         self.monochrome_sprites.clear();
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
@@ -121,6 +123,11 @@ impl Scene {
                 underline.order = order;
                 self.underlines.push(*underline);
             }
+            Primitive::LineSegment(line) => {
+                crate::frame_stats::bump_primitive("LineSegment");
+                line.order = order;
+                self.line_segments.push(*line);
+            }
             Primitive::MonochromeSprite(sprite) => {
                 crate::frame_stats::bump_primitive("MonochromeSprite");
                 sprite.order = order;
@@ -161,6 +168,7 @@ impl Scene {
         self.quads.sort_by_key(|quad| quad.order);
         self.paths.sort_by_key(|path| path.order);
         self.underlines.sort_by_key(|underline| underline.order);
+        self.line_segments.sort_by_key(|line| line.order);
         self.monochrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.subpixel_sprites
@@ -187,6 +195,8 @@ impl Scene {
             paths_iter: self.paths.iter().peekable(),
             underlines_start: 0,
             underlines_iter: self.underlines.iter().peekable(),
+            line_segments_start: 0,
+            line_segments_iter: self.line_segments.iter().peekable(),
             monochrome_sprites_start: 0,
             monochrome_sprites_iter: self.monochrome_sprites.iter().peekable(),
             subpixel_sprites_start: 0,
@@ -213,6 +223,7 @@ pub(crate) enum PrimitiveKind {
     Quad,
     Path,
     Underline,
+    LineSegment,
     MonochromeSprite,
     SubpixelSprite,
     PolychromeSprite,
@@ -232,6 +243,7 @@ pub enum Primitive {
     Quad(Quad),
     Path(Path<ScaledPixels>),
     Underline(Underline),
+    LineSegment(LineSegment),
     MonochromeSprite(MonochromeSprite),
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
@@ -246,6 +258,7 @@ impl Primitive {
             Primitive::Quad(quad) => &quad.bounds,
             Primitive::Path(path) => &path.bounds,
             Primitive::Underline(underline) => &underline.bounds,
+            Primitive::LineSegment(line) => &line.bounds,
             Primitive::MonochromeSprite(sprite) => &sprite.bounds,
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
@@ -259,6 +272,7 @@ impl Primitive {
             Primitive::Quad(quad) => &quad.content_mask,
             Primitive::Path(path) => &path.content_mask,
             Primitive::Underline(underline) => &underline.content_mask,
+            Primitive::LineSegment(line) => &line.content_mask,
             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
@@ -283,6 +297,8 @@ struct BatchIterator<'a> {
     paths_iter: Peekable<slice::Iter<'a, Path<ScaledPixels>>>,
     underlines_start: usize,
     underlines_iter: Peekable<slice::Iter<'a, Underline>>,
+    line_segments_start: usize,
+    line_segments_iter: Peekable<slice::Iter<'a, LineSegment>>,
     monochrome_sprites_start: usize,
     monochrome_sprites_iter: Peekable<slice::Iter<'a, MonochromeSprite>>,
     subpixel_sprites_start: usize,
@@ -307,6 +323,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.underlines_iter.peek().map(|u| u.order),
                 PrimitiveKind::Underline,
+            ),
+            (
+                self.line_segments_iter.peek().map(|l| l.order),
+                PrimitiveKind::LineSegment,
             ),
             (
                 self.monochrome_sprites_iter.peek().map(|s| s.order),
@@ -391,6 +411,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 }
                 self.underlines_start = underlines_end;
                 Some(PrimitiveBatch::Underlines(underlines_start..underlines_end))
+            }
+            PrimitiveKind::LineSegment => {
+                let lines_start = self.line_segments_start;
+                let mut lines_end = lines_start + 1;
+                self.line_segments_iter.next();
+                while self
+                    .line_segments_iter
+                    .next_if(|line| (line.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    lines_end += 1;
+                }
+                self.line_segments_start = lines_end;
+                Some(PrimitiveBatch::LineSegments(lines_start..lines_end))
             }
             PrimitiveKind::MonochromeSprite => {
                 let texture_id = self.monochrome_sprites_iter.peek().unwrap().tile.texture_id;
@@ -487,6 +521,7 @@ pub enum PrimitiveBatch {
     Quads(Range<usize>),
     Paths(Range<usize>),
     Underlines(Range<usize>),
+    LineSegments(Range<usize>),
     MonochromeSprites {
         texture_id: AtlasTextureId,
         range: Range<usize>,
@@ -511,6 +546,7 @@ impl PrimitiveBatch {
             Self::Quads(range) => format!("quads ({})", range.len()),
             Self::Paths(range) => format!("paths ({})", range.len()),
             Self::Underlines(range) => format!("underlines ({})", range.len()),
+            Self::LineSegments(range) => format!("line segments ({})", range.len()),
             Self::MonochromeSprites { texture_id, range } => {
                 format!(
                     "monochrome sprites ({}) on atlas {}",
@@ -573,6 +609,34 @@ pub struct Underline {
 impl From<Underline> for Primitive {
     fn from(underline: Underline) -> Self {
         Primitive::Underline(underline)
+    }
+}
+
+/// A straight line from `a` to `b`, `2 * half_width` wide, square-ended, drawn as one
+/// instanced quad laid along it and antialiased in its fragment shader
+/// ([`crate::Window::paint_line_segments`]). For many thin lines a frame (a tracked lattice's
+/// mesh): a [`Path`] of the same lines carries six vertices per line, copied three times on the
+/// CPU each frame, and is rasterized through an offscreen multisampled pass.
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct LineSegment {
+    pub order: DrawOrder,
+    pub pad: u32, // align to 8 bytes
+    /// The axis-aligned box the line (with its antialiasing margin) covers: what the scene
+    /// orders and clips by.
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub color: Hsla,
+    pub a: Point<ScaledPixels>,
+    pub b: Point<ScaledPixels>,
+    pub half_width: ScaledPixels,
+    pub pad2: u32, // align to 8 bytes
+}
+
+impl From<LineSegment> for Primitive {
+    fn from(line: LineSegment) -> Self {
+        Primitive::LineSegment(line)
     }
 }
 

@@ -6,6 +6,8 @@ use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
     PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
 };
+#[cfg(test)]
+use gpui::LineSegment;
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
 use objc2::runtime::AnyObject;
@@ -140,6 +142,7 @@ pub struct MetalRenderer {
     shadows_pipeline_state: metal::RenderPipelineState,
     quads_pipeline_state: metal::RenderPipelineState,
     underlines_pipeline_state: metal::RenderPipelineState,
+    line_segments_pipeline_state: metal::RenderPipelineState,
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
@@ -380,6 +383,14 @@ impl MetalRenderer {
             "underline_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let line_segments_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "line_segments",
+            "line_segment_vertex",
+            "line_segment_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
         let monochrome_sprites_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -441,6 +452,7 @@ impl MetalRenderer {
             shadows_pipeline_state,
             quads_pipeline_state,
             underlines_pipeline_state,
+            line_segments_pipeline_state,
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
@@ -605,11 +617,12 @@ impl MetalRenderer {
         );
         let instance_bindings = write_instances(scene, &mut writer).with_context(|| {
             format!(
-                "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
+                "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} lines, {} mono, {} poly, {} surfaces",
                 scene.paths.len(),
                 scene.shadows.len(),
                 scene.quads.len(),
                 scene.underlines.len(),
+                scene.line_segments.len(),
                 scene.monochrome_sprites.len(),
                 scene.polychrome_sprites.len(),
                 scene.surfaces.len(),
@@ -837,6 +850,9 @@ impl MetalRenderer {
                             return Err(error);
                         }
                     }
+                }
+                PrimitiveBatch::LineSegments(range) => {
+                    self.draw_line_segments(range, instance_bindings, viewport_size, command_encoder)
                 }
                 PrimitiveBatch::Underlines(range) => {
                     self.draw_underlines(range, instance_bindings, viewport_size, command_encoder)
@@ -1137,6 +1153,50 @@ impl MetalRenderer {
             6,
             underlines.len() as u64,
             underlines.start as u64,
+        );
+    }
+
+    /// The lines (`LineSegment`), one instance of the unit quad each, laid along the line in
+    /// the vertex shader and antialiased in the fragment shader: no offscreen pass.
+    fn draw_line_segments(
+        &self,
+        lines: Range<usize>,
+        instance_bindings: &InstanceBindings,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) {
+        if lines.is_empty() {
+            return;
+        }
+
+        command_encoder.set_render_pipeline_state(&self.line_segments_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            LineSegmentInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_buffer(
+            LineSegmentInputIndex::LineSegments as u64,
+            Some(&instance_bindings.line_segments.buffer),
+            instance_bindings.line_segments.offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
+            LineSegmentInputIndex::LineSegments as u64,
+            Some(&instance_bindings.line_segments.buffer),
+            instance_bindings.line_segments.offset as u64,
+        );
+        command_encoder.set_vertex_bytes(
+            LineSegmentInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+
+        command_encoder.draw_primitives_instanced_base_instance(
+            metal::MTLPrimitiveType::Triangle,
+            0,
+            6,
+            lines.len() as u64,
+            lines.start as u64,
         );
     }
 
@@ -1528,6 +1588,7 @@ struct InstanceBindings {
     quads: InstanceBinding,
     shadows: InstanceBinding,
     underlines: InstanceBinding,
+    line_segments: InstanceBinding,
     monochrome_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
     surfaces: InstanceBinding,
@@ -1538,6 +1599,7 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
         quads: writer.write(&scene.quads)?,
         shadows: writer.write(&scene.shadows)?,
         underlines: writer.write(&scene.underlines)?,
+        line_segments: writer.write(&scene.line_segments)?,
         monochrome_sprites: writer.write(&scene.monochrome_sprites)?,
         polychrome_sprites: writer.write(&scene.polychrome_sprites)?,
         surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
@@ -1697,6 +1759,13 @@ enum QuadInputIndex {
 enum UnderlineInputIndex {
     Vertices = 0,
     Underlines = 1,
+    ViewportSize = 2,
+}
+
+#[repr(C)]
+enum LineSegmentInputIndex {
+    Vertices = 0,
+    LineSegments = 1,
     ViewportSize = 2,
 }
 
@@ -1959,5 +2028,81 @@ mod tests {
         let gone = |x: u32, y: u32| img.get_pixel(x, y).0[0] < 8;
         assert!(dark(&img, 20, 20) && bright(&img, 2, 30), "perspective: inside the trapezoid");
         assert!(gone(20, 23) && gone(26, 10) && gone(10, 31), "perspective: outside it");
+    }
+
+    /// `LineSegment`s drawn in the frame's own pass, read back from a headless render: a
+    /// horizontal line covers its rows and its square ends half its width past each end and
+    /// nothing beside it; a 45-degree line covers its centre line and not a point 7.8 px off
+    /// it; the content mask cuts a line; a line a quarter pixel either side of a row boundary
+    /// gives the two rows partial coverage (the antialiased edge).
+    #[test]
+    fn render_line_segments() {
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())));
+        let full = Bounds {
+            origin: Point::default(),
+            size: size(ScaledPixels(64.0), ScaledPixels(64.0)),
+        };
+        let red = gpui::Hsla { h: 0.0, s: 1.0, l: 0.5, a: 1.0 };
+        let line = |a: (f32, f32), b: (f32, f32), half_width: f32, mask: Bounds<ScaledPixels>| {
+            let grow = half_width + 1.0;
+            let (x0, y0) = (a.0.min(b.0) - grow, a.1.min(b.1) - grow);
+            let (x1, y1) = (a.0.max(b.0) + grow, a.1.max(b.1) + grow);
+            LineSegment {
+                order: 0,
+                pad: 0,
+                bounds: Bounds {
+                    origin: point(ScaledPixels(x0), ScaledPixels(y0)),
+                    size: size(ScaledPixels(x1 - x0), ScaledPixels(y1 - y0)),
+                },
+                content_mask: ContentMask { bounds: mask },
+                color: red,
+                a: point(ScaledPixels(a.0), ScaledPixels(a.1)),
+                b: point(ScaledPixels(b.0), ScaledPixels(b.1)),
+                half_width: ScaledPixels(half_width),
+                pad2: 0,
+            }
+        };
+        let left_half = Bounds {
+            origin: Point::default(),
+            size: size(ScaledPixels(30.0), ScaledPixels(64.0)),
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(line((8.0, 20.0), (56.0, 20.0), 1.0, full));
+        scene.insert_primitive(line((10.0, 30.0), (40.0, 60.0), 1.5, full));
+        scene.insert_primitive(line((8.0, 10.0), (56.0, 10.0), 1.0, left_half));
+        scene.insert_primitive(line((8.0, 44.0), (56.0, 44.0), 0.25, full));
+        scene.finish();
+        assert_eq!(scene.line_segments.len(), 4);
+        assert!(
+            scene
+                .batches()
+                .all(|b| matches!(b, PrimitiveBatch::LineSegments(_))),
+            "the lines batch as lines"
+        );
+        let img = renderer
+            .render_scene_to_image(&scene, size(DevicePixels(64), DevicePixels(64)))
+            .unwrap();
+        let r = |x: u32, y: u32| img.get_pixel(x, y).0[0];
+        let on = |x: u32, y: u32| r(x, y) > 200;
+        let off = |x: u32, y: u32| r(x, y) < 8;
+
+        // Horizontal, rows 19 and 20 (y 19..21), x 7..57 with the square ends.
+        assert!(on(32, 19) && on(32, 20) && on(8, 20) && on(55, 20), "horizontal: covered");
+        assert!(off(32, 17) && off(32, 22), "horizontal: not beside it");
+        assert!(off(5, 20) && off(58, 20), "horizontal: not past its square ends");
+
+        // 45 degrees, y = x + 20.
+        assert!(on(25, 45) && on(35, 55), "diagonal: its centre line");
+        assert!(off(31, 40) && off(20, 50), "diagonal: 7.8 px off it");
+
+        // Cut by a content mask at x = 30.
+        assert!(on(20, 10) && off(40, 10), "masked: drawn left of x = 30 only");
+
+        // A half-pixel-wide line on the boundary between rows 43 and 44: each row a quarter.
+        for y in [43u32, 44] {
+            let v = r(32, y);
+            assert!((30..=120).contains(&v), "thin line: row {y} partial coverage, red {v}");
+        }
+        assert!(off(32, 42) && off(32, 45), "thin line: nothing past it");
     }
 }
