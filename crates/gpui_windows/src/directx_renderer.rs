@@ -385,6 +385,8 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                // Drawn by the Metal renderer only (`Window::paint_line_segments`).
+                PrimitiveBatch::LineSegments(_lines) => Ok(()),
             }
             .with_context(|| {
                 format!(

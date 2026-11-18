@@ -625,6 +625,74 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
   }
 }
 
+// A straight line (`LineSegment`): the unit quad laid along it, from half its width
+// before `a` to half its width past `b` (a square end) and half its width either side,
+// each grown by one pixel for the antialiased edge. The fragment shader takes its
+// coverage from the pixel's distance outside that rectangle, in the line's own axes.
+struct LineSegmentVertexOutput {
+  float4 position [[position]];
+  float4 color [[flat]];
+  float2 local;
+  float length [[flat]];
+  float half_width [[flat]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct LineSegmentFragmentInput {
+  float4 position [[position]];
+  float4 color [[flat]];
+  float2 local;
+  float length [[flat]];
+  float half_width [[flat]];
+};
+
+vertex LineSegmentVertexOutput line_segment_vertex(
+    uint unit_vertex_id [[vertex_id]], uint line_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(LineSegmentInputIndex_Vertices)]],
+    constant LineSegment *lines [[buffer(LineSegmentInputIndex_LineSegments)]],
+    constant Size_DevicePixels *input_viewport_size
+    [[buffer(LineSegmentInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  LineSegment line = lines[line_id];
+  float2 a = float2(line.a.x, line.a.y);
+  float2 b = float2(line.b.x, line.b.y);
+  float hw = line.half_width;
+  float2 d = b - a;
+  float len = length(d);
+  float2 dir = len > 0. ? d / len : float2(1., 0.);
+  float2 nrm = float2(-dir.y, dir.x);
+  float reach = hw + 1.;
+  // Along the line from -reach to len + reach, across it from -reach to +reach.
+  float along = mix(-reach, len + reach, unit_vertex.x);
+  float across = mix(-reach, reach, unit_vertex.y);
+  float2 position = a + dir * along + nrm * across;
+
+  float2 viewport_size = float2((float)input_viewport_size->width,
+                                (float)input_viewport_size->height);
+  float2 device_position =
+      position / viewport_size * float2(2., -2.) + float2(-1., 1.);
+  Bounds_ScaledPixels clip = line.content_mask.bounds;
+  return LineSegmentVertexOutput{
+      float4(device_position, 0., 1.),
+      hsla_to_rgba(line.color),
+      float2(along, across),
+      len,
+      hw,
+      {position.x - clip.origin.x,
+       clip.origin.x + clip.size.width - position.x,
+       position.y - clip.origin.y,
+       clip.origin.y + clip.size.height - position.y}};
+}
+
+fragment float4 line_segment_fragment(LineSegmentFragmentInput input [[stage_in]]) {
+  // Distance outside the line's rectangle (square ends) along each of its axes.
+  float outside_along = max(-input.half_width - input.local.x,
+                            input.local.x - (input.length + input.half_width));
+  float outside_across = abs(input.local.y) - input.half_width;
+  float alpha = saturate(0.5 - max(outside_along, outside_across));
+  return input.color * float4(1., 1., 1., alpha);
+}
+
 struct MonochromeSpriteVertexOutput {
   float4 position [[position]];
   float2 tile_position;

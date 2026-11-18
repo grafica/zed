@@ -11,7 +11,7 @@ use crate::{
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, LineSegment, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
@@ -4788,6 +4788,53 @@ impl Window {
         self.next_frame
             .scene
             .insert_primitive(path.scale(scale_factor));
+    }
+
+    /// Paint straight lines into the scene for the next frame at the current z-index: each
+    /// `(a, b)` a line from `a` to `b`, `width` wide, square-ended, antialiased. Each line is
+    /// one instance of a quad laid along it ([`LineSegment`]), drawn in the frame's own pass:
+    /// for many thin lines a frame, far cheaper than a [`Path`] of them (six vertices a line,
+    /// copied three times, and an offscreen multisampled pass). Inside [`Window::paint_layer`]
+    /// the lines share its draw order and are not each inserted into the scene's bounds tree.
+    /// Drawn by the Metal renderer (macOS, iOS); the wgpu and DirectX renderers skip them.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_line_segments(
+        &mut self,
+        segments: impl IntoIterator<Item = (Point<Pixels>, Point<Pixels>)>,
+        width: Pixels,
+        color: impl Into<Hsla>,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask().scale(scale_factor);
+        let mut color: Hsla = color.into();
+        color.a *= self.element_opacity();
+        let half_width = 0.5 * f32::from(width) * scale_factor;
+        // The box a line's quad covers: its ends, grown by half its width and the
+        // one-pixel antialiasing margin the shader draws into.
+        let grow = half_width + 1.0;
+        for (a, b) in segments {
+            let (ax, ay) = (f32::from(a.x) * scale_factor, f32::from(a.y) * scale_factor);
+            let (bx, by) = (f32::from(b.x) * scale_factor, f32::from(b.y) * scale_factor);
+            let (x0, y0) = (ax.min(bx) - grow, ay.min(by) - grow);
+            let (x1, y1) = (ax.max(bx) + grow, ay.max(by) + grow);
+            self.next_frame.scene.insert_primitive(LineSegment {
+                order: 0,
+                pad: 0,
+                bounds: Bounds {
+                    origin: point(ScaledPixels(x0), ScaledPixels(y0)),
+                    size: size(ScaledPixels(x1 - x0), ScaledPixels(y1 - y0)),
+                },
+                content_mask,
+                color,
+                a: point(ScaledPixels(ax), ScaledPixels(ay)),
+                b: point(ScaledPixels(bx), ScaledPixels(by)),
+                half_width: ScaledPixels(half_width),
+                pad2: 0,
+            });
+        }
     }
 
     /// Paint an underline into the scene for the next frame at the current z-index.

@@ -53,6 +53,8 @@ mod apple_build {
             "QuadInputIndex".into(),
             "Underline".into(),
             "UnderlineInputIndex".into(),
+            "LineSegment".into(),
+            "LineSegmentInputIndex".into(),
             "Quad".into(),
             "BorderStyle".into(),
             "SpriteInputIndex".into(),

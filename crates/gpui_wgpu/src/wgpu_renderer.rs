@@ -1606,6 +1606,8 @@ impl WgpuRendererCore {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
+                    // Drawn by the Metal renderer only (`Window::paint_line_segments`).
+                    PrimitiveBatch::LineSegments(_lines) => {}
                 }
             }
         }
