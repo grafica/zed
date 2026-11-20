@@ -137,6 +137,18 @@ pub fn set_status_bar_style(style: crate::StatusBarContentStyle) {
     }
 }
 
+/// Offers every window a frame now instead of at the next display-link tick: a window gpui
+/// has marked dirty is drawn at once (a clean one does nothing). For an app whose content
+/// changes on its own clock (a camera), so a change is not left waiting up to a refresh
+/// interval for the tick. Main thread only, and never from inside a gpui update or draw.
+pub fn draw_now() {
+    if let Some(platform) = super::application::current_platform() {
+        platform
+            .application
+            .with_windows(IosWindowState::request_frame);
+    }
+}
+
 define_class!(
     #[unsafe(super = UIView)]
     #[thread_kind = MainThreadOnly]

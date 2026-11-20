@@ -2,12 +2,12 @@ use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use core_graphics::geometry::CGSize;
+#[cfg(test)]
+use gpui::LineSegment;
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
     PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
 };
-#[cfg(test)]
-use gpui::LineSegment;
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
 use objc2::runtime::AnyObject;
@@ -593,6 +593,25 @@ impl MetalRenderer {
 
         hook(FramePass::AfterRender, &self.device, &command_buffer);
 
+        // The drawable's `presentedTime` (host seconds; 0 when it was never shown) to the
+        // registered handler (`set_presented_handler`), with the host time of this commit.
+        if let Some(handler) = PRESENTED_HANDLER.lock().clone() {
+            let commit_s = presented_host_seconds();
+            let block = RcBlock::new(move |drawable: *mut AnyObject| {
+                if drawable.is_null() {
+                    return;
+                }
+                // SAFETY: `drawable` is the presented `id<MTLDrawable>`; a read-only property.
+                let presented: f64 = unsafe { objc2::msg_send![drawable, presentedTime] };
+                handler(commit_s, presented);
+            });
+            let raw = drawable.as_ptr() as *mut AnyObject;
+            // SAFETY: a live `id<MTLDrawable>` not yet presented; Metal copies the block.
+            unsafe {
+                let _: () = objc2::msg_send![raw, addPresentedHandler: &*block];
+            }
+        }
+
         if self.presents_with_transaction {
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
@@ -851,9 +870,12 @@ impl MetalRenderer {
                         }
                     }
                 }
-                PrimitiveBatch::LineSegments(range) => {
-                    self.draw_line_segments(range, instance_bindings, viewport_size, command_encoder)
-                }
+                PrimitiveBatch::LineSegments(range) => self.draw_line_segments(
+                    range,
+                    instance_bindings,
+                    viewport_size,
+                    command_encoder,
+                ),
                 PrimitiveBatch::Underlines(range) => {
                     self.draw_underlines(range, instance_bindings, viewport_size, command_encoder)
                 }
@@ -2000,34 +2022,73 @@ mod tests {
 
         // (a) The unit transform: the boundary at column 16.
         let img = render([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], bounds);
-        assert!(bright(&img, 4, 16) && bright(&img, 14, 16), "unit: the left half is bright");
-        assert!(dark(&img, 18, 16) && dark(&img, 28, 16), "unit: the right half is dark");
+        assert!(
+            bright(&img, 4, 16) && bright(&img, 14, 16),
+            "unit: the left half is bright"
+        );
+        assert!(
+            dark(&img, 18, 16) && dark(&img, 28, 16),
+            "unit: the right half is dark"
+        );
 
         // (b) Shifted 8 px right: the boundary at column 24, the uncovered left strip not bright.
         let img = render([[1.0, 0.0, 8.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], bounds);
-        assert!(bright(&img, 12, 16) && bright(&img, 22, 16), "shift: bright up to column 24");
-        assert!(dark(&img, 26, 16) && dark(&img, 30, 16), "shift: dark past it");
-        assert!(!bright(&img, 4, 16), "shift: the strip the quad left is not the bright half");
+        assert!(
+            bright(&img, 12, 16) && bright(&img, 22, 16),
+            "shift: bright up to column 24"
+        );
+        assert!(
+            dark(&img, 26, 16) && dark(&img, 30, 16),
+            "shift: dark past it"
+        );
+        assert!(
+            !bright(&img, 4, 16),
+            "shift: the strip the quad left is not the bright half"
+        );
 
         // (c) A quarter turn about (16, 16): (x, y) -> (16 - (y - 16), 16 + (x - 16)): the bright
         // left half becomes the top half.
-        let img = render([[0.0, -1.0, 32.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], bounds);
-        assert!(bright(&img, 16, 4) && bright(&img, 8, 12), "turn: the top half is bright");
-        assert!(dark(&img, 16, 28) && dark(&img, 24, 20), "turn: the bottom half is dark");
+        let img = render(
+            [[0.0, -1.0, 32.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            bounds,
+        );
+        assert!(
+            bright(&img, 16, 4) && bright(&img, 8, 12),
+            "turn: the top half is bright"
+        );
+        assert!(
+            dark(&img, 16, 28) && dark(&img, 24, 20),
+            "turn: the bottom half is dark"
+        );
 
         // (d) Perspective: w = 1 + x / 64, a point (x, y) shown at (x, y) / w: the boundary
         // (x = 16) at 12.8, the quad's right edge (x = 32) at 21.3 and shortened to 21.3 tall,
         // its bottom edge running from (0, 32) to (21.3, 21.3). The texture follows the divide
         // (the bright half ends at 12.8 on every row inside the quad), and the quad's shape is
         // the trapezoid: inside at (20, 20) and (2, 30), outside at (20, 23) and (26, 10).
-        let img = render([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0 / 64.0, 0.0, 1.0]], bounds);
+        let img = render(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0 / 64.0, 0.0, 1.0]],
+            bounds,
+        );
         for y in [2u32, 10, 16] {
-            assert!(bright(&img, 6, y) && bright(&img, 11, y), "perspective: bright up to 12.8, row {y}");
-            assert!(dark(&img, 14, y) && dark(&img, 19, y), "perspective: dark from 12.8 to 21.3, row {y}");
+            assert!(
+                bright(&img, 6, y) && bright(&img, 11, y),
+                "perspective: bright up to 12.8, row {y}"
+            );
+            assert!(
+                dark(&img, 14, y) && dark(&img, 19, y),
+                "perspective: dark from 12.8 to 21.3, row {y}"
+            );
         }
         let gone = |x: u32, y: u32| img.get_pixel(x, y).0[0] < 8;
-        assert!(dark(&img, 20, 20) && bright(&img, 2, 30), "perspective: inside the trapezoid");
-        assert!(gone(20, 23) && gone(26, 10) && gone(10, 31), "perspective: outside it");
+        assert!(
+            dark(&img, 20, 20) && bright(&img, 2, 30),
+            "perspective: inside the trapezoid"
+        );
+        assert!(
+            gone(20, 23) && gone(26, 10) && gone(10, 31),
+            "perspective: outside it"
+        );
     }
 
     /// `LineSegment`s drawn in the frame's own pass, read back from a headless render: a
@@ -2042,7 +2103,12 @@ mod tests {
             origin: Point::default(),
             size: size(ScaledPixels(64.0), ScaledPixels(64.0)),
         };
-        let red = gpui::Hsla { h: 0.0, s: 1.0, l: 0.5, a: 1.0 };
+        let red = gpui::Hsla {
+            h: 0.0,
+            s: 1.0,
+            l: 0.5,
+            a: 1.0,
+        };
         let line = |a: (f32, f32), b: (f32, f32), half_width: f32, mask: Bounds<ScaledPixels>| {
             let grow = half_width + 1.0;
             let (x0, y0) = (a.0.min(b.0) - grow, a.1.min(b.1) - grow);
@@ -2087,22 +2153,66 @@ mod tests {
         let off = |x: u32, y: u32| r(x, y) < 8;
 
         // Horizontal, rows 19 and 20 (y 19..21), x 7..57 with the square ends.
-        assert!(on(32, 19) && on(32, 20) && on(8, 20) && on(55, 20), "horizontal: covered");
+        assert!(
+            on(32, 19) && on(32, 20) && on(8, 20) && on(55, 20),
+            "horizontal: covered"
+        );
         assert!(off(32, 17) && off(32, 22), "horizontal: not beside it");
-        assert!(off(5, 20) && off(58, 20), "horizontal: not past its square ends");
+        assert!(
+            off(5, 20) && off(58, 20),
+            "horizontal: not past its square ends"
+        );
 
         // 45 degrees, y = x + 20.
         assert!(on(25, 45) && on(35, 55), "diagonal: its centre line");
         assert!(off(31, 40) && off(20, 50), "diagonal: 7.8 px off it");
 
         // Cut by a content mask at x = 30.
-        assert!(on(20, 10) && off(40, 10), "masked: drawn left of x = 30 only");
+        assert!(
+            on(20, 10) && off(40, 10),
+            "masked: drawn left of x = 30 only"
+        );
 
         // A half-pixel-wide line on the boundary between rows 43 and 44: each row a quarter.
         for y in [43u32, 44] {
             let v = r(32, y);
-            assert!((30..=120).contains(&v), "thin line: row {y} partial coverage, red {v}");
+            assert!(
+                (30..=120).contains(&v),
+                "thin line: row {y} partial coverage, red {v}"
+            );
         }
         assert!(off(32, 42) && off(32, 45), "thin line: nothing past it");
+    }
+}
+
+/// Called once per drawn frame, on a Metal thread, with the host time (`mach_absolute_time`,
+/// seconds) just before the frame's command buffer was committed and the time its drawable
+/// was shown (`MTLDrawable.presentedTime`, 0 when it never was). A measurement hook: one
+/// process-wide slot, as `gpui_ios::ios::frame_hook` is.
+pub type PresentedHandler = Arc<dyn Fn(f64, f64) + Send + Sync>;
+static PRESENTED_HANDLER: Mutex<Option<PresentedHandler>> = Mutex::new(None);
+
+/// Registers (`Some`) or removes (`None`) the presented handler.
+pub fn set_presented_handler(handler: Option<PresentedHandler>) {
+    *PRESENTED_HANDLER.lock() = handler;
+}
+
+fn presented_host_seconds() -> f64 {
+    #[repr(C)]
+    struct Tb {
+        numer: u32,
+        denom: u32,
+    }
+    unsafe extern "C" {
+        fn mach_absolute_time() -> u64;
+        fn mach_timebase_info(info: *mut Tb) -> i32;
+    }
+    let mut tb = Tb { numer: 0, denom: 0 };
+    // SAFETY: plain mach calls on a valid out-parameter.
+    let (t, ok) = unsafe { (mach_absolute_time(), mach_timebase_info(&mut tb)) };
+    if ok == 0 && tb.denom != 0 {
+        t as f64 * tb.numer as f64 / tb.denom as f64 * 1e-9
+    } else {
+        t as f64 * 1e-9
     }
 }
