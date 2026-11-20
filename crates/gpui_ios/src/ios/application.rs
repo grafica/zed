@@ -333,6 +333,7 @@ define_class!(
                 let display_link =
                     CADisplayLink::displayLinkWithTarget_selector(self, sel!(renderFrame:));
                 display_link.setPaused(true);
+                apply_preferred_frame_rate(&display_link);
                 display_link.addToRunLoop_forMode(
                     &NSRunLoop::mainRunLoop(),
                     NSRunLoopCommonModes,
@@ -539,5 +540,46 @@ mod tests {
         assert_eq!(warnings.get(), 0);
         first.notify_memory_warning();
         assert_eq!(warnings.get(), 1);
+    }
+}
+
+/// The display link's requested rate, Hz as `f32` bits (0: the system's choice).
+static PREFERRED_FRAME_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn apply_preferred_frame_rate(display_link: &CADisplayLink) {
+    let hz = f32::from_bits(PREFERRED_FRAME_RATE.load(std::sync::atomic::Ordering::Relaxed));
+    let range = if hz > 0.0 {
+        objc2_quartz_core::CAFrameRateRange {
+            minimum: hz,
+            maximum: hz,
+            preferred: hz,
+        }
+    } else {
+        // CAFrameRateRangeDefault: no preference.
+        objc2_quartz_core::CAFrameRateRange {
+            minimum: 0.0,
+            maximum: 0.0,
+            preferred: 0.0,
+        }
+    };
+    display_link.setPreferredFrameRateRange(range);
+}
+
+/// Asks the display link that drives gpui's frames for `hz` (`None`: the system's choice).
+///
+/// With no preference iOS runs a ProMotion display at the rate the content changes, and a
+/// camera's 60 Hz keeps it at 60, where the compositor puts about two refresh intervals
+/// (~30 ms) between a commit and the glass; at 120 Hz that is about half. Above 60 Hz needs
+/// `CADisableMinimumFrameDurationOnPhone` in the app's Info.plist. Main thread only.
+pub fn set_preferred_frame_rate(hz: Option<f32>) {
+    let bits = hz
+        .filter(|h| *h > 0.0 && h.is_finite())
+        .unwrap_or(0.0)
+        .to_bits();
+    PREFERRED_FRAME_RATE.store(bits, std::sync::atomic::Ordering::Relaxed);
+    if let Some(platform) = current_platform() {
+        if let Some(display_link) = platform.application.display_link.borrow().as_ref() {
+            apply_preferred_frame_rate(display_link);
+        }
     }
 }

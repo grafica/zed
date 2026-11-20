@@ -48,10 +48,12 @@ impl<T> CallbackSlot<T> {
     }
 }
 
+pub use application::set_preferred_frame_rate;
 pub(crate) use display::*;
+pub use gpui_apple::metal_renderer::{PresentedHandler, set_presented_handler};
 pub use platform::*;
-pub use window::set_status_bar_style;
 pub(crate) use window::*;
+pub use window::{draw_now, set_status_bar_style};
 
 /// Returns the native platform implementation for iOS.
 pub fn current_platform(_headless: bool) -> std::rc::Rc<dyn gpui::Platform> {
